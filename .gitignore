@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# 运行期生成的文件：里面有你本机的位置、设置、日志和浏览器缓存，别提交
+# ---------------------------------------------------------------------------
+
+# WebView2 的浏览器缓存 / 用户数据（几百 MB，且含本机信息）
+.webview2/
+.webview2-runtime/
+
+# 日志
+pet.log
+pet-stacks.log
+watcher.log
+
+# 桌宠自己的状态：位置、全部设置（首次启动会自动生成默认值）
+pet_position.json
+pet_settings.json
+settings_window.json
+
+# 单实例标记 / 停止请求 / 排查截图
+pet.pid
+stop.request
+clear-cache.request
+desktop-link.done
+selftest.png
+黑边修复-用旧版.txt
+
+# 本地还原点（改代码前的备份，不进仓库）
+_备份/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---------------------------------------------------------------------------
+# 可选：不想把 Python 依赖（vendor/，约 24MB）一起提交，就把下面这行取消注释，
+# 改成用 `pip install -r requirements.txt` 安装（README 里有说明）。
+# ---------------------------------------------------------------------------
+# vendor/
+
+# ---------------------------------------------------------------------------
+# 浏览器登录态：chat-bridge/edge-profile 里是 chat.deepseek.com 的登录 cookie，
+# **绝对不能提交**（几百 MB，且等于把账号会话公开）
+# ---------------------------------------------------------------------------
+chat-bridge/edge-profile/
+chat-bridge/bridge.log
+
+# 排障开关文件（本机临时放的）
+stackdump.request
+no-hook.request
+debug-port.request
+clear-cache.request
+
+# 临时备份
+*.bak

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent 桌宠</title>
+    <link rel="icon" href="model/icon.png" />
+    <!-- KaTeX：回复气泡里的数学公式排版（本地文件，不需要联网） -->
+    <link rel="stylesheet" href="lib/katex/katex.min.css" />
+    <link rel="stylesheet" href="pet.css" />
+  </head>
+  <body>
+    <!-- 进度卡片：画在桌宠自己的网页里，宽度固定、高度由内容撑开，不改窗口尺寸 -->
+    <div id="card" class="card style-glass hidden">
+      <div class="card-bg"></div>
+      <div class="card-body">
+        <div class="card-head">
+          <span class="card-dot" id="card-dot"></span>
+          <span class="card-state" id="card-state">空闲</span>
+        </div>
+        <div class="card-title" id="card-title">当前没有进行中的任务</div>
+        <div class="card-row">
+          <span class="k">已用时</span><span class="v" id="card-elapsed">—</span>
+          <span class="k">工具调用</span><span class="v" id="card-tools">—</span>
+        </div>
+        <div class="card-row">
+          <span class="k">上下文</span><span class="v" id="card-tokens">—</span>
+          <span class="k">来源</span><span class="v" id="card-source">—</span>
+        </div>
+        <div class="card-activity" id="card-activity">
+          <div class="card-activity-text" id="card-activity-text">等待 Agent 开始工作…</div>
+          <div class="card-usage" id="card-usage"></div>
+        </div>
+        <div class="card-say" id="card-say"></div>
+      </div>
+    </div>
+
+    <div id="chip" class="chip hidden">
+      <span class="chip-dot" id="chip-dot"></span>
+      <span id="chip-text">空闲</span>
+    </div>
+
+    <!-- 和 chat.deepseek.com 对话用：气泡显示流式回复，按钮负责弹出输入框。
+         样式对齐参考插件 dsh-whale-girl-live2d 的 dshp-bubble / composer。 -->
+    <div id="chat-bubble" class="chat-bubble hidden">
+      <div class="chat-bubble-head">
+        <span class="chat-bubble-dot" id="chat-bubble-dot"></span>
+        <span id="chat-bubble-name">DeepSeek</span>
+        <!-- 关闭键：点击由宿主钩子命中（网页收不到鼠标事件）。
+             回复气泡现在会一直留着，靠它手动收起。 -->
+        <span class="chat-bubble-close" id="chat-bubble-close" title="收起气泡">✕</span>
+      </div>
+      <div class="chat-bubble-main">
+        <div class="chat-bubble-body" id="chat-bubble-body"></div>
+        <!-- 滚动条本身拖不动（网页收不到鼠标事件），所以给两个按钮：
+             位置上报给宿主，由全局鼠标钩子命中点击 —— 和「说话」按钮同一套机制。 -->
+        <div class="chat-bubble-scroll">
+          <div class="chat-scroll-btn" id="chat-scroll-up" title="向上看">▲</div>
+          <div class="chat-scroll-btn" id="chat-scroll-down" title="向下看">▼</div>
+        </div>
+      </div>
+      <div class="chat-bubble-foot" id="chat-bubble-foot"></div>
+    </div>
+
+    <div id="chat-btn" class="chat-btn hidden" title="和 DeepSeek 说话（单击展开输入框）">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M12 3C6.9 3 2.8 6.4 2.8 10.6c0 2.4 1.5 4.5 3.8 5.9-.2 1-.7 2.1-1.5 3.1-.3.4 0 .9.5.8 2.2-.3 3.9-1.1 5-1.8 .4.1.9.1 1.4.1 5.1 0 9.2-3.4 9.2-7.6S17.1 3 12 3z"
+        />
+      </svg>
+    </div>
+
+    <!-- 和「说话」按钮并排的两个快捷键按钮（点击同样由宿主钩子命中） -->
+    <div id="dsh-btn" class="pet-key-btn hidden" title="切到 DeepSeek Harness 网页版">DSH</div>
+    <div id="deepseek-btn" class="pet-key-btn hidden" title="切到 chat.deepseek.com（专用 Edge）">DS</div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <!-- 可手动关闭的常驻提示：DSH 掉线时显示，等用户重启 DSH 后自动收起 -->
+    <div id="notice" class="notice hidden">
+      <div class="notice-head">
+        <span class="notice-dot"></span>
+        <span class="notice-title" id="notice-title">提示</span>
+        <button class="notice-close" id="notice-close" type="button" title="关闭提示">✕</button>
+      </div>
+      <div class="notice-body" id="notice-body"></div>
+    </div>
+
+    <!-- 权限申请卡片：DSH 需要批准时出现在模型上方。
+         网页收不到鼠标事件，「允许/拒绝」两个按钮同样由宿主的全局鼠标钩子命中
+         （位置由 pet.js 上报，和「说话」按钮同一套机制）。 -->
+    <div id="approval" class="approval hidden">
+      <div class="approval-head">
+        <span class="approval-dot"></span>
+        <span class="approval-title" id="approval-title">需要授权</span>
+        <button class="approval-close" id="approval-close" type="button"
+                title="先收起（不批准也不拒绝）">✕</button>
+      </div>
+      <div class="approval-body">
+        <div class="approval-tool" id="approval-tool"></div>
+        <div class="approval-detail" id="approval-detail"></div>
+      </div>
+      <div class="approval-actions">
+        <button class="approval-btn allow" id="approval-allow" type="button">允许</button>
+        <button class="approval-btn deny" id="approval-deny" type="button">拒绝</button>
+      </div>
+    </div>
+
+    <!-- 部分打包库会探测 Node 的 process/global，浏览器里先给个壳 -->
+    <script>
+      window.process = window.process || { env: {}, platform: "browser", version: "" };
+      window.global = window.global || window;
+    </script>
+    <script src="lib/pixi-v6.min.js"></script>
+    <script src="lib/live2dcubismcore.min.js"></script>
+    <script src="lib/pixi-live2d-display-cubism4.min.js"></script>
+    <!-- KaTeX 要在 pet.js 之前加载：气泡渲染时会用到 window.katex -->
+    <script src="lib/katex/katex.min.js"></script>
+    <script src="pet.js"></script>
+  </body>
+</html>
