@@ -289,8 +289,8 @@ class ApprovalWatcher:
         self._lock = threading.Lock()
         self._ws = None
         self._client_id = ""
-        self._current = None        # 当前待批准
-        self._last_key = "\x00"     # 去重键：只有变化才通知界面
+        self._pending = {}          # 待批准队列：eventId -> payload（插入有序）
+        self._last_key = "\x00"     # 去重键：只有"要显示的那条"变了才通知界面
 
     # ---- 生命周期 ----
 
@@ -309,9 +309,21 @@ class ApprovalWatcher:
 
     def has_pending(self) -> bool:
         with self._lock:
-            return self._current is not None
+            return bool(self._pending)
 
     # ---- 对外：回答当前申请 ----
+
+    def dismiss(self) -> None:
+        """用户点了卡片 ✕：把队首这条拿掉（**不回应**），弹下一条。
+
+        申请仍留在 DSH 里（想处理还能去网页界面点），只是桌宠不再显示它；
+        后面若还有别的申请，紧接着弹出来，不会被这一条卡住。
+        """
+        with self._lock:
+            pending = list(self._pending.items())
+            if pending:
+                self._pending.pop(pending[0][0], None)
+        self._notify_current(force=True)
 
     def answer_async(self, decision: str) -> bool:
         """异步回答（**界面线程必须用这个**）。
@@ -333,15 +345,12 @@ class ApprovalWatcher:
         if decision not in ("allowed-once", "rejected"):
             return False
         with self._lock:
-            current = self._current
+            pending = list(self._pending.items())   # 保持插入顺序，队首是"当前显示的那条"
             client_id = self._client_id
-        # self._current 是我们自己构造的 payload，键名是 id（不是 eventId）。
-        # 这里原先写成 current.get("eventId")，永远取不到值 ——
-        # 于是点击「允许/拒绝」一律被当成"没有待批准申请"直接忽略。
-        if not current or not current.get("id") or not client_id:
+        if not pending or not client_id:
             self.log("权限应答被忽略：当前没有待批准的申请")
             return False
-        event_id = current["id"]
+        event_id = pending[0][0]
 
         body = json.dumps({
             "type": "client-request",
@@ -374,18 +383,19 @@ class ApprovalWatcher:
             self.log("回传权限决定失败：%r" % (exc,))
             return False
 
-        # 乐观收卡片；服务端随后还会用 cancel 帧确认一次
+        # 乐观出队；服务端随后还会用 cancel 帧确认一次。
+        # 还有别的在等就紧接着弹下一条（多个会话同时申请时不再丢）。
         with self._lock:
-            self._current = None
-        self._notify(None, force=True)
+            self._pending.pop(event_id, None)
+        self._notify_current(force=True)
         return ok
 
     # ---- 内部：通知界面（带去重）----
 
-    def _notify(self, payload, force: bool = False) -> None:
-        # 注意：payload 里标识申请用的字段名是 **"id"**（见 _handle 构造的字典）。
-        # 这里曾经写成 .get("eventId")，永远是空串 —— 第一次推送后 _last_key 变成 ""，
-        # 其后的申请全被判成"没变化"静默丢弃，表现是"卡片只在最早那次弹过"。
+    def _notify_current(self, force: bool = False) -> None:
+        """把"当前要显示的那条"（队首）推给界面；队列空就推 None 收卡片。"""
+        with self._lock:
+            payload = next(iter(self._pending.values())) if self._pending else None
         key = (payload or {}).get("id") or ""
         if not force and key == self._last_key:
             return                     # 内容没变：不碰界面，省一次重排
@@ -431,8 +441,8 @@ class ApprovalWatcher:
                 self.log("权限事件订阅断开：%r（%.0f 秒后重连）" % (exc, backoff))
                 with self._lock:
                     self._client_id = ""
-                    self._current = None
-                self._notify(None, force=True)   # 断开时收卡片，别对着过期申请点
+                    self._pending = {}           # 重连后服务端会补发积压，先清空旧队列
+                self._notify_current(force=True)  # 断开时收卡片，别对着过期申请点
                 if ws is not None:
                     ws.close()
                 self._stop.wait(backoff)
@@ -456,13 +466,12 @@ class ApprovalWatcher:
             return
 
         if kind == "cancel":
-            # 这次申请已经被别人（浏览器界面）答掉了，或者被取消
+            # 这条申请已经被别人（浏览器界面）答掉了，或者被取消
             event_id = str(value.get("eventId") or "")
             with self._lock:
-                current = self._current
-                if current and current.get("id") == event_id:
-                    self._current = None
-                    self._notify(None, force=True)
+                removed = self._pending.pop(event_id, None)
+            if removed:
+                self._notify_current(force=True)   # 还有别的就弹下一条，没有就收卡片
             return
 
         if kind != "waterfall":
@@ -491,6 +500,6 @@ class ApprovalWatcher:
             "detail": raw_reason if (friendly and raw_reason and raw_reason != friendly) else "",
         }
         with self._lock:
-            self._current = payload
+            self._pending[event_id] = payload      # 入队；同时来多条也不会互相覆盖
         self.log("收到权限申请：%s（%s）" % (tool or "未知工具", (friendly or raw_reason)[:80]))
-        self._notify(payload)
+        self._notify_current()

@@ -45,6 +45,11 @@ TAIL_BYTES = 1_200_000
 RECENT_FOR_FLASH = 30.0
 # 助手刚说完 → "完成了"保留这么久，之后回空闲
 DONE_KEEP_SECONDS = 90.0
+# 多个会话同时跑时：某个刚完成，先把这个"完成"闪显这么久，再切回运行中的
+DONE_FLASH_SECONDS = 6.0
+# 运行中会话的"新鲜度"上限：文件 mtime 超过这么久还标着 openStep，就当是
+# 僵尸会话（异常退出后 DSH 没清理），忽略它，别让任务卡片卡在"执行中"。
+STALE_RUNNING_SECONDS = 180.0
 # 用户发完一直没动静：先当思考中，超过这个时间当"等待你"
 WAITING_AFTER_SECONDS = 45.0
 # 再久就回空闲（半小时没人碰就当收工）
@@ -1517,13 +1522,90 @@ def _dsh_block(rows: dict, key: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+# 缓存：{patterns: (取到时间, 路径)}。跑一次扫描解析所有会话文件，3 秒内复用。
+_RUNNING_SESSION_CACHE: dict = {}
+
+
+def _dsh_is_running(path: str) -> bool:
+    """读一个 dsh 会话投影文件，判断它现在是不是真的在跑（这一轮还开着）。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    record = data.get("record") if isinstance(data, dict) else None
+    rows = record.get("rows") if isinstance(record, dict) else None
+    if not isinstance(rows, dict):
+        return False
+    stats = _dsh_block(rows, "sessionStats")
+    boundary = _dsh_block(rows, "turnBoundary")
+    pending = stats.get("pendingCalls") if isinstance(stats.get("pendingCalls"), dict) else {}
+    last_boundary = boundary.get("lastStepBoundary")
+    last_boundary = last_boundary if isinstance(last_boundary, dict) else {}
+    return (
+        bool(pending)
+        or stats.get("openStep") is not None
+        or boundary.get("openTurnStartSeq") is not None
+        or str(last_boundary.get("kind") or "") == "start"
+    )
+
+
+def _running_session_file(patterns) -> tuple[str | None, float]:
+    """在 dsh 会话里挑一个「正在运行」的（优先）；没有就返回 (None, 0)。
+
+    返回 (路径, mtime)。调用方拿不到运行中的会话时，再退回 _newest_file 的最新值。
+    """
+    key = tuple(patterns or [])
+    now = _now()
+    hit = _RUNNING_SESSION_CACHE.get(key)
+    if hit and now - hit[0] < NEWEST_CACHE_TTL:
+        return hit[1], hit[2]
+
+    files = []
+    for pattern in patterns or []:
+        try:
+            matches = glob.glob(pattern, recursive=True)
+        except (OSError, re.error):
+            continue
+        for item in matches:
+            try:
+                if os.path.isfile(item):
+                    files.append((os.path.getmtime(item), item))
+            except OSError:
+                continue
+    # 从新到旧：同时找"正在跑"的和"刚完成"的
+    files.sort(key=lambda pair: pair[0], reverse=True)
+    running_path, running_mtime = None, 0.0
+    done_path, done_mtime = None, 0.0
+    for mt, item in files:
+        if _dsh_is_running(item):
+            # 只有"最近还在写文件"的运行中会话才认；很久没动的僵尸会话跳过
+            if running_path is None and (now - mt) < STALE_RUNNING_SECONDS:
+                running_path, running_mtime = item, mt
+        elif done_path is None and (now - mt) < DONE_FLASH_SECONDS:
+            # 不是 running 但文件还很新 = 这一轮刚收尾写过 → 先闪显它的完成信息
+            done_path, done_mtime = item, mt
+        if running_path is not None and done_path is not None:
+            break
+    # 优先级：刚完成的 > 正在运行的。约 6 秒后 done 的文件 mtime 变旧，自然让位。
+    if done_path:
+        path, mtime = done_path, done_mtime
+    else:
+        path, mtime = running_path, running_mtime
+    _RUNNING_SESSION_CACHE[key] = (now, path, mtime)
+    return path, mtime
+
+
 def _dsh_snapshot(spec: dict) -> dict:
     """dsh 桌面版：~/.dsh/storages/session_projcache/sessions/*.json 是实时的"投影缓存"。
 
     里面直接写了：这一轮开着没有（openTurnStartSeq / openStep / pendingCalls）、
     有没有在等用户回答（userQuestions.active）、累计 token、最后一次提问时间。
     """
-    path, mtime = _newest_file(spec.get("roots") or [])
+    # 优先绑定「正在运行」的会话；没有在跑的再退回"最近修改过"的那个
+    path, mtime = _running_session_file(spec.get("roots") or [])
+    if not path:
+        path, mtime = _newest_file(spec.get("roots") or [])
     if not path:
         return _idle_payload(spec)
     try:

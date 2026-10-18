@@ -72,6 +72,7 @@ const DEFAULTS = {
   autoExpression: true,
   autoMotion: true,
   alwaysOnTop: true,
+  yieldFullscreen: true,
   showChip: true,
   fpsLimit: 60,
   cardStyle: "glass",
@@ -107,7 +108,7 @@ const STATE_DEFAULT_EXPR = {
 
 // 每一栏"恢复默认"管哪些设置
 const RESET_SCOPES = {
-  appearance: ["scale", "opacity", "gazeRange", "autoExpression", "autoMotion", "alwaysOnTop", "showChip", "fpsLimit"],
+  appearance: ["scale", "opacity", "gazeRange", "autoExpression", "autoMotion", "alwaysOnTop", "yieldFullscreen", "showChip", "fpsLimit"],
   agent: ["agent", "usageMode", "autostart"],
   card: ["cardStyle", "cardGap", "cardScaleWithPet", "followDesktop", "wheelZoom", "cardBlur"],
   bottom: ["bottomButtonsMode"],
@@ -268,6 +269,7 @@ function collect() {
     moodSeconds: Number($("moodSeconds").value),
     fpsLimit: Number($("fpsLimit").value),
     alwaysOnTop: $("alwaysOnTop").checked,
+    yieldFullscreen: $("yieldFullscreen").checked,
     showChip: $("showChip").checked,
     followDesktop: $("followDesktop").checked,
     usageMode: $("usageMode").value,
@@ -410,6 +412,7 @@ function render(cfg) {
   $("fpsLimit").value = String(cfg.fpsLimit != null ? cfg.fpsLimit : 60);
   renderFps = Number(cfg.renderFps || 0) || 0;
   $("alwaysOnTop").checked = cfg.alwaysOnTop !== false;
+  $("yieldFullscreen").checked = cfg.yieldFullscreen !== false;
   $("showChip").checked = cfg.showChip !== false;
   $("followDesktop").checked = cfg.followDesktop !== false;
   $("usageMode").value = cfg.usageMode || "today";
@@ -585,7 +588,7 @@ function wire() {
   $("gazeRange").addEventListener("change", push);
   $("moodSeconds").addEventListener("input", () => ($("mood-out").textContent = Number($("moodSeconds").value) + " 秒"));
   $("moodSeconds").addEventListener("change", push);
-  ["alwaysOnTop", "showChip", "followDesktop", "wheelZoom", "cardBlur", "usageMode"].forEach((id) =>
+  ["alwaysOnTop", "yieldFullscreen", "showChip", "followDesktop", "wheelZoom", "cardBlur", "usageMode"].forEach((id) =>
     $(id).addEventListener("change", push)
   );
   $("cardStyle").addEventListener("change", push);
@@ -737,6 +740,7 @@ if (!(window.chrome && window.chrome.webview)) {
       scale: 1,
       opacity: 1,
       alwaysOnTop: true,
+      yieldFullscreen: true,
       followDesktop: true,
       showChip: true,
       autostart: false,

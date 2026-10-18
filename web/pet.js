@@ -71,16 +71,25 @@ const bridge = (() => {
 
 const el = (id) => document.getElementById(id);
 
+// 浏览器自己的良性告警：ResizeObserver 在布局里再次触发尺寸变化时会报这句，
+// 不是页面 bug，也没法稳定复现；别把它当错误写进宿主日志（会刷屏）。
+const IGNORED_PAGE_ERROR = /ResizeObserver loop/i;
+
+function reportPageError(message) {
+  if (IGNORED_PAGE_ERROR.test(message)) return;
+  bridge.send({ t: "error", message });
+}
+
 window.addEventListener("error", (ev) =>
-  bridge.send({ t: "error", message: `${ev.message} @ ${ev.filename}:${ev.lineno}:${ev.colno}` })
+  reportPageError(`${ev.message} @ ${ev.filename}:${ev.lineno}:${ev.colno}`)
 );
 window.addEventListener("unhandledrejection", (ev) =>
-  bridge.send({ t: "error", message: "unhandled rejection: " + String(ev.reason && ev.reason.stack ? ev.reason.stack : ev.reason) })
+  reportPageError("unhandled rejection: " + String(ev.reason && ev.reason.stack ? ev.reason.stack : ev.reason))
 );
 for (const level of ["error", "warn"]) {
   const original = console[level].bind(console);
   console[level] = (...args) => {
-    bridge.send({ t: "error", message: `${level}: ` + args.map(String).join(" ") });
+    reportPageError(`${level}: ` + args.map(String).join(" "));
     original(...args);
   };
 }
@@ -153,7 +162,10 @@ const state = {
     clamped: false, distance: 0,
   },
   gazeAt: 0,
-  fpsLimit: 60,         // 当前生效的渲染帧率上限（0 = 不限制），由设置决定
+  fpsLimit: 60,
+  attention: true,       // 现在需不需要满帧（鼠标在桌宠上 / 有弹窗）
+  idleSince: 0,          // 从什么时候开始"没人看"
+  fpsEffective: 60,      // 当前生效的帧率上限（空闲降帧后可能低于 fpsLimit）
   fpsValue: 0,          // 最近一秒统计到的真实帧数
   fpsTicks: 0,
   fpsWindowStart: 0,
@@ -236,11 +248,61 @@ function applyFpsLimit() {
   const raw = hasValue ? Number(cfg.fpsLimit) : NaN;   // 设置还没送到时别把 null 当成"不限"
   let limit = DEFAULT_FPS_LIMIT;
   if (Number.isFinite(raw)) limit = raw <= 0 ? 0 : Math.min(360, Math.round(raw));
-  const shared = PIXI.Ticker.shared;
-  shared.maxFPS = limit;
-  if (app && app.ticker && app.ticker !== shared) app.ticker.maxFPS = limit;
   state.fpsLimit = limit;
+  applyEffectiveFps();      // 实际帧率还要看"现在需不需要满帧"
   return limit;
+}
+
+/* ---- 空闲降帧 ------------------------------------------------------------
+   桌宠平时是常驻 60fps 重绘的（Live2D + 透明分层窗口，每帧都要 DWM 合成）。
+   鼠标不在它身上、也没有弹窗要看的时候，把帧率降到 30 —— 持续的 CPU/GPU 与
+   合成开销直接减半；一旦鼠标靠近或有气泡 / 提示 / 权限卡片，立刻恢复设置里的上限。
+
+   为什么值得做：用户反馈"开着桌宠开 QQ 也有轻微卡顿"，那是常态重绘在跟别的
+   程序抢资源。把没人看时的开销砍掉，比事后去救帧更有效。
+*/
+const IDLE_FPS_LIMIT = 30;        // 空闲帧率上限
+const IDLE_FPS_AFTER_MS = 2000;   // 鼠标离开后多久才降（避免划过就抖）
+
+/** 有没有"需要看清/正在变化"的浮层在显示。
+ *
+ *  任务卡片不算：它是静态 HTML，常开时若也算"要满帧"，空闲降帧就永远不生效
+ *  （用户的 cardOpen 默认是 true，等于这个优化从没跑起来）。聊天气泡可能正在
+ *  流式长字、提示和权限卡片需要立刻看清，仍然保持满帧。
+ */
+function overlayActive() {
+  const bubble = Boolean(
+    chat.shown && ui.chatBubble && !ui.chatBubble.classList.contains("hidden")
+  );
+  return bubble || Boolean(notice.open) || Boolean(approval.open);
+}
+
+/** 按当前"注意力"状态把生效帧率写进 ticker（值不变就不碰）。 */
+function applyEffectiveFps() {
+  const base = state.fpsLimit || 0;
+  let want = base;
+  if (base > 0 && !state.attention) want = Math.min(base, IDLE_FPS_LIMIT);
+  const shared = PIXI.Ticker.shared;
+  if (shared && shared.maxFPS !== want) shared.maxFPS = want;
+  if (app && app.ticker && app.ticker !== shared && app.ticker.maxFPS !== want) {
+    app.ticker.maxFPS = want;
+  }
+  state.fpsEffective = want;
+}
+
+/** 重新判断现在该不该满帧。cursor 的 inside 状态一变就会调到这里。 */
+function syncAttention(inside) {
+  const now = performance.now();
+  const att = Boolean(inside) || overlayActive();
+  if (att) {
+    state.attention = true;
+    state.idleSince = 0;
+  } else if (!state.idleSince) {
+    state.idleSince = now;
+  } else if (state.attention && now - state.idleSince >= IDLE_FPS_AFTER_MS) {
+    state.attention = false;
+  }
+  applyEffectiveFps();
 }
 
 /** 数帧：每秒统计一次真实渲染帧数（比 ticker 自带的平滑 FPS 准，
@@ -269,6 +331,10 @@ function countFrame() {
     state.fpsWindowStart = now;
     state.frameMaxGap = 0;
     state.frameSlowCount = 0;
+    // 每秒兜底判一次"要不要满帧"：宿主只在**鼠标移动或进出窗口**时发光标消息，
+    // 鼠标静止在窗口外时 onCursor 根本不会被调用，attention 会一直停在 true ——
+    // 实测降帧就是不生效（仍跑满 59fps）。
+    syncAttention(state.cursor && state.cursor.inside);
   }
 }
 
@@ -944,6 +1010,7 @@ function gazeRange() {
 function onCursor(data) {
   if (!data) return;
   state.cursor = data;
+  syncAttention(data.inside);      // 鼠标在不在桌宠上 → 决定要不要满帧
   const now = Date.now();
   if (data.inside) {
     if (!state.hoverSince) state.hoverSince = now;
@@ -2499,8 +2566,11 @@ function pokeReact() {
   const key = state.key || "idle";
   const busy = key !== "idle" && key !== "done";
 
-  // 干活时被戳：只给一次性反应，不动工作状态
+  // 干活时被戳：只给一次性反应，不动工作状态。
+  // 但**弹跳和空闲时一样**：之前这里漏了 bounceModel，任务中戳下去没反馈，
+  // 手感像没点中（用户反馈）。
   if (busy) {
+    bounceModel(1);
     pokeAct(pickWeighted(POKE_BUSY), 1200, true);
     return;
   }
@@ -2722,6 +2792,10 @@ window.__pet = {
   app: () => app,
   getStatus: () => ({
     state: state.key,
+    fps: Math.round(state.fpsValue || 0),
+    fpsLimit: state.fpsLimit,
+    fpsEffective: state.fpsEffective,
+    attention: state.attention,
     label: STATE_STYLE[state.key] ? STATE_STYLE[state.key].label : state.key,
     expression: state.expression,
     tempExpr: state.tempExpr || null,

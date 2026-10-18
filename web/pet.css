@@ -448,10 +448,10 @@ canvas {
   color: var(--ink);
   border: 1px solid var(--edge);
   box-shadow: 0 8px 28px rgba(10, 14, 30, 0.28);
-  /* 这里可以放心用背景模糊：气泡只在收到新回复时重绘，不随鼠标移动变化，
-     所以不会和视线跟随抢帧。按钮上就绝对不能加（见 .pet-key-btn 的注释）。 */
-  backdrop-filter: blur(14px) saturate(1.3);
-  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+  /* 不能用 backdrop-filter：虽然气泡自己不常变，但它**下面就是 60fps 重绘的
+     Live2D**，整个分层窗口每帧都要重绘 —— 有模糊就得每帧回读背景重算一遍，
+     实测会带来轻微但持续的迟滞（.approval 早就不用了，同一原因）。
+     去掉模糊后改用更不透明的底色，观感差别很小。 */
   font-size: 12.5px;
   line-height: 1.55;
   opacity: 0;
@@ -829,12 +829,14 @@ canvas {
   width: min(300px, calc(100% - 16px));
   padding: 8px 10px 9px;
   border-radius: 12px;
-  background: rgba(24, 20, 26, 0.94);
+  background: rgba(24, 20, 26, 0.97);
   border: 1px solid rgba(255, 138, 138, 0.35);
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
-  /* 静态元素，可以放心用背景模糊（不随鼠标重绘，不会和视线跟随抢帧） */
-  backdrop-filter: blur(14px) saturate(1.2);
-  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  /* 这里**绝对不能**用 backdrop-filter：桌宠是色键透明的分层窗口，而 Live2D 是
+     60fps 持续重绘的 —— 每一帧重绘都要回读背景重新模糊，实测会明显拖慢重绘，
+     表现为鼠标轻微迟滞。这张提示卡又恰好只在 DSH 掉线/启动失败时出现，
+     等于"最需要流畅的时候"最卡（用户实测反馈）。
+     改用更不透明的纯色背景，视觉上几乎一样。 */
   color: #f2eef4;
   font-size: 11.5px;
   line-height: 1.55;

@@ -70,6 +70,7 @@ DEFAULTS = {
     "scale": 1.0,
     "opacity": 1.0,
     "alwaysOnTop": True,
+    "yieldFullscreen": True,  # 全屏程序（游戏/播放器）在前时隐藏桌宠、暂停渲染并摘掉鼠标钩子
     "followDesktop": True,
     "showChip": True,
     "cardOpen": False,       # 进度卡片上次是开着还是收起的：启动时按这个状态还原
@@ -173,6 +174,7 @@ def save(data: dict) -> dict:
     if not isinstance(clean.get("expressionAllowed"), list):
         clean["expressionAllowed"] = ["*"]
     clean["alwaysOnTop"] = bool(clean["alwaysOnTop"])
+    clean["yieldFullscreen"] = bool(clean["yieldFullscreen"])
     clean["followDesktop"] = bool(clean["followDesktop"])
     clean["showChip"] = bool(clean["showChip"])
     clean["cardOpen"] = bool(clean.get("cardOpen", False))

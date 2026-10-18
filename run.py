@@ -21,6 +21,7 @@ import math
 import os
 import queue
 import socket
+import subprocess
 import socketserver
 import sys
 import threading
@@ -216,6 +217,22 @@ kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
 kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
 user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(ctypes.c_ulong)]
 user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    """GetMonitorInfoW 用的结构（判断前台窗口有没有铺满整个显示器）。"""
+
+    _fields_ = [
+        ("cbSize", wt.DWORD),
+        ("rcMonitor", wt.RECT),
+        ("rcWork", wt.RECT),
+        ("dwFlags", wt.DWORD),
+    ]
+
+
+user32.MonitorFromWindow.restype = ctypes.c_void_p
+user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+user32.GetMonitorInfoW.restype = wt.BOOL
 user32.GetAncestor.restype = wt.HWND
 user32.SetCapture.argtypes = [wt.HWND]
 user32.SetCapture.restype = wt.HWND
@@ -238,6 +255,11 @@ DSH_OFFLINE_TTL = 5.0
 # 为什么需要迟滞：窗口枚举会"看见/看不见"交替出现，直接跟随会让人看到
 # 桌宠隐藏↔恢复来回闪。抖动的特征是**单拍漏看**（几十~一两百毫秒），
 # 所以几百毫秒的窗口足够滤掉它；设太大（曾经 1.2/2.0 秒）会让切换明显变慢。
+
+# 全屏程序（游戏/播放器）在前时的让位迟滞：和 DSH 那套同一思路，
+# 用「持续时间」判断，避免全屏窗口枚举抖动导致来回隐藏/恢复。
+FULLSCREEN_PRESENT_SECONDS = 0.6
+FULLSCREEN_ABSENT_SECONDS = 1.2
 DSH_NEAR_PRESENT_SECONDS = 0.30    # 持续看见这么久 → 认定 DSH 在前（隐藏 + 暂停渲染）
 DSH_NEAR_ABSENT_SECONDS = 0.50     # 持续看不见这么久 → 认定它关掉了（恢复显示 + 渲染）
 
@@ -1003,6 +1025,14 @@ class PetHost:
         self._cache_size_busy = False
         self._cache_size_ready = False
         self.form_input_works = False
+        self._page_ready = False          # 页面发过消息了吗（没起来之前别往 WebView2 发）
+        self._closing = False             # 正在关闭：钩子回调直接放行
+        # 全屏程序让位（游戏/播放器在前时隐藏、暂停渲染、摘钩子）
+        self._fullscreen_present = False
+        self._fs_since = 0.0
+        self._fs_last_hit = 0.0
+        self._hook_suspended = False
+        self._dsh_opening = False         # 「打开 DSH」流程只允许一个在跑
         self.card = None
         self.card_webview = None
         # 进度卡片开着没：按上次关掉桌宠时的状态来（settings_store 的 cardOpen，默认收起）
@@ -1141,6 +1171,7 @@ class PetHost:
         webview.WebMessageReceived += self.on_web_message
         form.Shown += self.on_shown
         form.MouseWheel += self.on_mouse_wheel
+        form.FormClosing += self.on_pet_closing   # 必须挂在主窗口上：卡片窗口是另建的（且默认不建）
         self.attach_mouse_events(form, webview)
         webview.EnsureCoreWebView2Async(None)
 
@@ -1196,7 +1227,12 @@ class PetHost:
     def on_ui_mouse_down(self, sender, args) -> None:
         from System.Windows.Forms import MouseButtons
 
-        self.form_input_works = True
+        # **只有钩子不可用的时候**才切到"真实窗口事件"这条路。
+        # 以前无条件置 True：钩子被看门狗摘掉期间点一下窗口，这个标志就永久变 True，
+        # 于是 handle_mouse 永远 early-return，按钮/拖动/滚轮全部失灵且不会恢复 ——
+        # 这正是"玩完全屏游戏后拖不动"的根因。
+        if not getattr(self, "_wheel_hook", None) or getattr(self, "_hook_stalled", False):
+            self.form_input_works = True
         x, y = self.cursor_screen()
         left = args.Button == MouseButtons.Left
         right = args.Button == MouseButtons.Right
@@ -1350,6 +1386,9 @@ class PetHost:
         core.Settings.AreDefaultContextMenusEnabled = False
         core.Settings.IsZoomControlEnabled = False
         core.Settings.AreDevToolsEnabled = bool(os.environ.get("CODEXPET_DEVTOOLS"))
+        # 每次导航开始都先把"页面已就绪"清掉：重载/崩溃恢复期间页面还没接收消息，
+        # 这时继续 flush 可能把界面线程卡在同步的 PostWebMessageAsJson 上。
+        core.NavigationStarting += self.on_page_navigation_starting
         if os.environ.get("CODEXPET_PINGTEST"):
             core.NavigateToString(
                 """<!doctype html><meta charset="utf-8"><body style="background:#123">
@@ -1443,6 +1482,12 @@ class PetHost:
         threading.Thread(target=show, daemon=True).start()
         threading.Thread(target=auto_close, daemon=True).start()
 
+    def on_page_navigation_starting(self, sender, args) -> None:
+        """导航开始：页面正在重新加载，先别往它发消息。"""
+        if self._page_ready:
+            self._page_ready = False
+            log("页面开始重新加载：暂停向页面发消息，等它回来再继续")
+
     def on_navigation_done(self, sender, args) -> None:
         log("页面加载完成：成功=%s 状态=%s" % (args.IsSuccess, args.WebErrorStatus))
         if not args.IsSuccess and not self.ready.is_set():
@@ -1468,6 +1513,7 @@ class PetHost:
                 if core is None:
                     log("WebView2 还没准备好，稍后再试")
                     return
+                self._page_ready = False
                 core.Reload()
 
             self.form.BeginInvoke(Action(do))
@@ -1480,6 +1526,9 @@ class PetHost:
         except Exception:
             return
         kind = msg.get("t")
+        if not self._page_ready:
+            self._page_ready = True
+            log("页面已就绪（收到第一条消息），开始向页面同步状态")
         if kind == "size":
             rect = msg.get("rect") or [0, 0, 0, 0]
             dpr = float(msg.get("dpr") or 1.0)
@@ -1648,10 +1697,18 @@ class PetHost:
     def post(self, message: dict) -> None:
         with self.lock:
             self.queue.append(message)
+            # 页面一直起不来时消息只进不出：给个上限，别无限堆
+            if len(self.queue) > 200:
+                del self.queue[:-200]
 
     # 消息合并与背压的目的见 COALESCE_TYPES 的注释（鼠标停滞的根因就在那里）。
     def flush(self) -> None:
         self.ui_phase("发送消息给页面")
+        # **页面还没起来就一条都不发**：PostWebMessageAsJson 是界面线程上的同步
+        # 跨进程调用，页面没加载完/正在关闭时它可能长时间不返回，把界面线程（也就是
+        # 鼠标钩子的宿主）钉住 —— 用户实测"页面没打开就关掉后鼠标明显发涩"就是这个。
+        if not self._page_ready:
+            return
         with self.lock:
             pending, self.queue = self.queue, []
         if not pending or self.webview is None or self.webview.CoreWebView2 is None:
@@ -1801,6 +1858,7 @@ class PetHost:
         self.drain_pet_btn()
         self.drain_pet_btn_hot()
         self.watch_dsh_window()
+        self.watch_fullscreen()
 
         hwnd = self.form.Handle.ToInt64()
         now = time.time()
@@ -2251,6 +2309,12 @@ class PetHost:
                     _st["max_dur"] = _dur
 
         def _hook_body(_t0, code, wparam, lparam):
+            # 正在关闭：立刻放行，别让系统等我们。
+            # 注意 restype 是 c_void_p：返回 0 时 ctypes 给的是 None，而钩子回调
+            # 必须返回整数，否则每个鼠标事件都会抛一次 TypeError。
+            if getattr(self, "_closing", False):
+                _res = user32.CallNextHookEx(None, code, wparam, lparam)
+                return 0 if _res is None else int(_res)
             if code >= 0:
                 # 右键：如果这一下点在角色像素上，就直接把它从系统那里吃掉。
                 # 这台机器上桌宠窗口对鼠标是全穿透的（实测 WindowFromPoint 把角色像素
@@ -2446,6 +2510,10 @@ class PetHost:
         self._hook_proc = HOOKPROC(hook)   # 必须留着引用，否则会被回收
         user32.SetWindowsHookExW.restype = ctypes.c_void_p
         self._wheel_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._hook_proc, None, 0)
+        if self._wheel_hook:
+            # 钩子又活了：把"真实窗口事件"那条备用路径关掉，交回钩子统一处理，
+            # 否则它会永久接管（玩完游戏后拖不动/按钮失灵就是这么来的）
+            self.form_input_works = False
         log("鼠标钩子：%s（由界面线程的消息循环分发）"
             % ("已安装" if self._wheel_hook else "安装失败（改用窗口滚轮事件）"))
         self.start_hook_watchdog()
@@ -2492,6 +2560,8 @@ class PetHost:
                     stalled = gap > 2.0
                     if gap > 1.5:
                         self.protect_fps("界面线程停顿 %.1f 秒" % gap)
+                    if getattr(self, "_hook_suspended", False):
+                        continue          # 是我们主动暂停的（桌宠不可见），别重复处理
                     if stalled and self._wheel_hook and not self._hook_stalled:
                         self._hook_stalled = True
                         self._stall_started = self._ui_heartbeat
@@ -4253,30 +4323,6 @@ class PetHost:
 
     # -- DeepSeek Harness（dsh web）-----------------------------------------
 
-    def dsh_shortcut_path(self) -> str:
-        """找桌面上那个 dsh 快捷方式。
-
-        设置里只写文件名（默认 deepseek_harness.lnk）时，按"当前用户桌面 → 公共桌面"
-        依次找；写了完整路径就直接用。
-        """
-        raw = str((self.settings or {}).get("dshShortcut") or "deepseek_harness.lnk").strip()
-        if not raw:
-            raw = "deepseek_harness.lnk"
-        if os.path.isabs(raw):
-            return raw if os.path.isfile(raw) else ""
-        candidates = []
-        try:
-            candidates.append(os.path.join(os.path.expanduser("~"), "Desktop"))
-        except Exception:  # noqa: BLE001
-            pass
-        public = os.environ.get("PUBLIC") or r"C:\Users\Public"
-        candidates.append(os.path.join(public, "Desktop"))
-        for folder in candidates:
-            path = os.path.join(folder, raw)
-            if os.path.isfile(path):
-                return path
-        return ""
-
     def dsh_web_port(self) -> int:
         try:
             return int((self.settings or {}).get("dshPort") or 3080)
@@ -4553,7 +4599,7 @@ class PetHost:
 
         def attempt(left: int) -> None:
             hit = self.find_dsh_web_window(kind="dsh" if self.dsh_web_ready_cached() else "any",
-                                           use_cache=False)
+                                           use_cache=False, include_minimized=True)
             if hit:
                 self.set_dsh_watch_present(True)
                 self._activate_window(hit[1], maximize=True)
@@ -4595,6 +4641,125 @@ class PetHost:
         self._dsh_win_cache = {}         # 状态变了：作废缓存，别让旧结果挡住
         if present:
             self._dsh_absent = 0
+
+    def fullscreen_foreground(self) -> bool:
+        """当前前台是不是一个"铺满整个显示器"的窗口（游戏 / 播放器 / 远程桌面）。"""
+        try:
+            hwnd = int(user32.GetForegroundWindow() or 0)
+            if not hwnd:
+                return False
+            form = getattr(self, "form", None)
+            if form is not None and hwnd == int(form.Handle.ToInt64()):
+                return False
+            # 桌面 / 任务栏自己不算全屏
+            if hwnd in (int(user32.GetDesktopWindow() or 0), int(user32.GetShellWindow() or 0)):
+                return False
+            rect = wt.RECT()
+            if not user32.GetWindowRect(wt.HWND(hwnd), ctypes.byref(rect)):
+                return False
+            if rect.right - rect.left < 200 or rect.bottom - rect.top < 200:
+                return False
+            mon = user32.MonitorFromWindow(wt.HWND(hwnd), 2)   # MONITOR_DEFAULTTONEAREST
+            if not mon:
+                return False
+            info = _MONITORINFO()
+            info.cbSize = ctypes.sizeof(_MONITORINFO)
+            if not user32.GetMonitorInfoW(ctypes.c_void_p(mon), ctypes.byref(info)):
+                return False
+            m = info.rcMonitor
+            # 允许 1px 误差：有些全屏窗口是 (0,0)-(w,h)，有些是 (-8,-8) 这种
+            return (
+                rect.left <= m.left + 1
+                and rect.top <= m.top + 1
+                and rect.right >= m.right - 1
+                and rect.bottom >= m.bottom - 1
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def suspend_mouse_hook(self) -> None:
+        """摘掉全局鼠标钩子（桌宠不可见时用）。
+
+        为什么值得做：WH_MOUSE_LL 的回调必须由安装它的界面线程及时处理。
+        全屏游戏时界面线程本来就忙，钩子会把每一次鼠标事件都过一遍我们的
+        Python 回调 —— 既是自己的负担，也可能让系统节流甚至丢掉钩子。
+        桌宠藏起来的时候我们根本不需要它，摘掉最干净。
+        """
+        if getattr(self, "_hook_suspended", False):
+            return
+        self._hook_suspended = True
+        handle = getattr(self, "_wheel_hook", None)
+        self._wheel_hook = None
+        # 钩子没了，成对的 UP 可能永远收不到：把"按下中"的状态清干净。
+        # 脉冲队列 / 待弹菜单也要清：否则恢复后第一拍会补放一个过期的 DOWN，
+        # 表现为"刚从全屏切回来，桌宠自己开始拖动/弹菜单"。
+        self._left_swallowed = False
+        self._left_swallow_for_button = False
+        self._right_swallowed = False
+        self._ls_down_at = None
+        self._rs_down_at = None
+        self._pending_menu_at = None
+        self._hook_mouse_steps.clear()
+        if handle:
+            try:
+                user32.UnhookWindowsHookEx(ctypes.c_void_p(handle))
+                log("鼠标钩子已暂停（桌宠不可见，不打扰前台程序）")
+            except Exception as exc:  # noqa: BLE001
+                log("暂停鼠标钩子失败：%r" % (exc,))
+
+    def resume_mouse_hook(self) -> None:
+        """把 suspend_mouse_hook 摘掉的钩子装回来（只在界面线程调用）。"""
+        if not getattr(self, "_hook_suspended", False):
+            return
+        self._hook_suspended = False
+        self._hook_stalled = False
+        if getattr(self, "_closing", False):
+            return                       # 已经在关闭了，别再装回去
+        try:
+            if not getattr(self, "_wheel_hook", None):
+                self._hook_proc_install()
+                log("鼠标钩子已恢复")
+        except Exception as exc:  # noqa: BLE001
+            log("恢复鼠标钩子失败：%r" % (exc,))
+
+    def watch_fullscreen(self) -> None:
+        """on_tick 每 110ms 叫一次：前台是不是全屏程序？是就让位。
+
+        全屏游戏期间：桌宠隐藏 + 不渲染 + 鼠标钩子摘掉 —— 三个动作一起做，
+        才不会出现"窗口看不见却还在抢置顶/吃输入"的怪状态。
+        """
+        if not (self.settings or {}).get("yieldFullscreen", True):
+            # 刚把开关关掉、而桌宠正为全屏让位：立即恢复，别等下一次全屏结束。
+            if getattr(self, "_fullscreen_present", False):
+                self._fullscreen_present = False
+                self._fs_since = 0.0
+                log("全屏让位已关闭：桌宠恢复显示与渲染")
+                self.apply_topmost()
+                self.apply_l2d_rendering()
+            return
+        now = time.time()
+        is_fs = self.fullscreen_foreground()
+        if is_fs:
+            self._fs_last_hit = now
+            if not getattr(self, "_fs_since", 0.0):
+                self._fs_since = now
+            if not getattr(self, "_fullscreen_present", False) and (
+                now - self._fs_since >= FULLSCREEN_PRESENT_SECONDS
+            ):
+                self._fullscreen_present = True
+                self._fs_since = 0.0
+                log("检测到全屏程序在前：桌宠让位（隐藏 + 暂停渲染 + 摘掉鼠标钩子）")
+                self.apply_topmost()
+                self.apply_l2d_rendering()
+        else:
+            self._fs_since = 0.0
+            if getattr(self, "_fullscreen_present", False) and (
+                now - getattr(self, "_fs_last_hit", 0.0) >= FULLSCREEN_ABSENT_SECONDS
+            ):
+                self._fullscreen_present = False
+                log("全屏程序已退出/切走：桌宠恢复显示与渲染")
+                self.apply_topmost()
+                self.apply_l2d_rendering()
 
     def watch_dsh_window(self) -> None:
         """on_tick 每 110ms 叫一次：dsh 窗口在不在 → 决定桌宠要不要置顶。
@@ -4685,7 +4850,9 @@ class PetHost:
             return
         # 用户明确要求：DSH 在前时桌宠**完全不动**（保持隐藏 + 不渲染），
         # 任何弹窗（气泡/提示/权限卡片）都不会把它叫出来。所以这里只看 DSH 在不在。
-        want_hidden = bool(getattr(self, "_dsh_present", False))
+        want_hidden = bool(
+            getattr(self, "_dsh_present", False) or getattr(self, "_fullscreen_present", False)
+        )
         hidden = bool(getattr(self, "_l2d_hidden", False))
         if hidden == want_hidden:
             return                           # 状态没变：别每 110ms 去碰窗口
@@ -4721,9 +4888,15 @@ class PetHost:
                     self.tray_icon.Visible = True
                 except Exception:  # noqa: BLE001
                     pass
-            log("切到 DeepSeek Harness：桌宠已隐藏（聊天输入框一并收起）；"
-                "托盘图标里可以「显示桌宠 / 和 DeepSeek 说话」")
+            reason = (
+                "全屏程序在前"
+                if getattr(self, "_fullscreen_present", False) and not getattr(self, "_dsh_present", False)
+                else "切到 DeepSeek Harness"
+            )
+            log("%s：桌宠已隐藏（聊天输入框一并收起）；"
+                "托盘图标里可以「显示桌宠 / 和 DeepSeek 说话」" % reason)
             self.set_render_paused(True)
+            self.suspend_mouse_hook()      # 看不见就别再占着全局鼠标钩子
             self._gc_collect_when_idle()
         except Exception as exc:  # noqa: BLE001
             log("隐藏桌宠失败：%r" % (exc,))
@@ -4765,7 +4938,8 @@ class PetHost:
             if card is not None and getattr(self, "_card_was_visible", False):
                 self.invoke_on_card(lambda: self.show_card_window(True))
             self._restore_chat_window()
-            log("DeepSeek Harness 页面收起了：桌宠已恢复显示（Live2D 重新渲染）")
+            log("让位结束：桌宠已恢复显示（Live2D 重新渲染）")
+            self.resume_mouse_hook()
             self.set_render_paused(False)
         except Exception as exc:  # noqa: BLE001
             log("恢复显示桌宠失败：%r" % (exc,))
@@ -4946,7 +5120,43 @@ class PetHost:
         # 保留覆盖反而会让隐藏窗口的 TopMost 无谓地来回切。
         if getattr(self, "_dsh_present", False):
             return False                     # 让位给 dsh 页面，别压着它
+        if getattr(self, "_fullscreen_present", False):
+            return False                     # 全屏程序在前：别跟它抢置顶
         return want
+
+    def on_pet_closing(self, sender, args) -> None:
+        """桌宠窗口要关了：先把鼠标钩子摘掉、定时器停掉。
+
+        为什么必须摘：WH_MOUSE_LL 由安装它的界面线程分发。进程退出过程中消息循环
+        先停、钩子却还挂着的话，系统会对**每一次鼠标事件**等我们的回调超时
+        （默认几百毫秒），表现就是"关掉桌宠以后鼠标一直发涩"。
+        """
+        self._closing = True
+        self._hook_suspended = True       # 关闭期间看门狗也别再装回钩子
+        handle = getattr(self, "_wheel_hook", None)
+        self._wheel_hook = None
+        if handle:
+            try:
+                user32.UnhookWindowsHookEx(ctypes.c_void_p(handle))
+                log("桌宠关闭中：鼠标钩子已摘除")
+            except Exception as exc:  # noqa: BLE001
+                log("关闭时摘除鼠标钩子失败：%r" % (exc,))
+        # 关闭时把还在计时的定时器都停掉：进程退出前每一次 Tick 都可能重新触发
+        # 窗口 / WebView2 调用；拖到最后一起收，用户看到的就是"退出慢、鼠标发涩"。
+        for name in ("timer", "cursor_timer", "drag_timer", "repair_timer"):
+            timer = getattr(self, name, None)
+            if timer is None:
+                continue
+            try:
+                timer.Stop()
+            except Exception:  # noqa: BLE001
+                pass
+        tray = getattr(self, "tray_icon", None)
+        if tray is not None:
+            try:
+                tray.Visible = False       # 别在托盘里留一个点了没反应的幽灵图标
+            except Exception:  # noqa: BLE001
+                pass
 
     def apply_topmost(self) -> None:
         """按"设置 + 当前是否让位给 dsh"算一次置顶，值没变就不去碰窗口。"""
@@ -4963,66 +5173,102 @@ class PetHost:
     def open_dsh(self) -> None:
         """「切换到 DeepSeek Harness」时调这个。
 
-        没开 dsh web → 跑桌面上那个快捷方式把它拉起来；
-        已经开着 → 找它的网页版窗口置顶，找不到就用浏览器打开。
-        服务刚起来时会等它就绪，再接着找窗口。
+        **必须立刻返回**：真正的探测/启动/等待都放到后台线程（见 _open_dsh_worker）。
+        以前这里同步跑完整条链路，dsh 起不来时（比如你把启动它的 shell 关掉了）
+        界面线程会被反复的 TCP 探测占住 —— 而低级鼠标钩子就挂在这个线程上，
+        于是整台电脑的鼠标都发涩（用户实测反馈）。
         """
         port = self.dsh_web_port()
-        running = self.dsh_web_running(port)
-        self.attach_dsh_watch()
-
-        if running:
-            hit = self.find_dsh_web_window(port, kind="any", use_cache=False)
-            if hit:
-                self._activate_window(hit[1], maximize=True)
-                self.set_dsh_watch_present(True)
-                log("DeepSeek Harness 已经在跑（端口 %d），已切到它的窗口（已最大化）：%s" % (port, hit[2]))
-                return
-            log("DeepSeek Harness 已经在跑（端口 %d），但没有开着的网页版窗口，用浏览器打开" % port)
-            self.open_dsh_page(port)
-            self._after(1.2, self._focus_dsh_browser, 4, 1.0)
+        # 连点防护：下面已经改到后台线程，连续两次点击会各起一个 worker，
+        # 可能把 DSH 快捷方式启动两遍（开出一排窗口）。整个打开流程只允许一个。
+        if getattr(self, "_dsh_opening", False):
+            log("正在打开 DSH，忽略这次重复点击")
             return
+        self._dsh_opening = True
+        self.attach_dsh_watch()          # 只设标志 + 置顶，很快，留在界面线程
+        threading.Thread(
+            target=self._open_dsh_worker, args=(port,), name="dsh-open", daemon=True
+        ).start()
 
-        shortcut = self.dsh_shortcut_path()
-        if not shortcut:
-            log("没找到 dsh 快捷方式（设置里的 dshShortcut=%r），直接开网页版"
-                % (self.settings or {}).get("dshShortcut"))
-            self.open_dsh_page(port)
-            self._after(1.2, self._focus_dsh_browser, 4, 1.0)
-            return
-
+    def _open_dsh_worker(self, port: int) -> None:
+        """后台线程：探测 → （必要时）启动 → 等就绪 → 回到界面线程切窗口。"""
         try:
-            os.startfile(shortcut)  # noqa: S606
-            log("DeepSeek Harness 没在跑，已启动：%s" % shortcut)
-        except Exception as exc:  # noqa: BLE001
-            log("启动 dsh 快捷方式失败：%r（改成直接开网页版）" % (exc,))
-            self.open_dsh_page(port)
-            self._after(1.2, self._focus_dsh_browser, 4, 1.0)
-            return
+            if self.dsh_web_running(port):
+                # include_minimized=True：DSH 窗口最小化时也要能找到并还原，
+                # 否则会误判成"没窗口"、接着去开新网页（每按一次多开一个）。
+                hit = self.find_dsh_web_window(port, kind="any", use_cache=False, include_minimized=True)
+                if hit:
+                    hwnd, title = hit[1], hit[2]
 
-        self.wait_dsh_then_focus(port)
+                    def focus() -> None:
+                        self.set_dsh_watch_present(True)
+                        self._activate_window(hwnd, maximize=True)
+                        log("DeepSeek Harness 已经在跑（端口 %d），已切到它的窗口：%s" % (port, title))
+
+                    self.invoke_on_pet(focus)
+                    return
+                log("DeepSeek Harness 已经在跑（端口 %d），但没有开着的网页版窗口，用浏览器打开" % port)
+                self.open_dsh_page(port)
+                self.invoke_on_pet(lambda: self._after(1.2, self._focus_dsh_browser, 4, 1.0))
+                return
+
+            # 直接跑命令启动 DSH 网页版，不依赖任何快捷方式。
+            # os.startfile(.lnk) 对指向 .cmd 的快捷方式会卡十来秒再抛
+            # OSError(22, '操作已被用户取消')（实测），所以改 subprocess。
+            npx = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "nodejs", "npx.cmd")
+            if not os.path.isfile(npx):
+                npx = "npx.cmd"     # 退回 PATH 查找
+            try:
+                subprocess.Popen(
+                    '"%s" --verbose @deepseek-ai/dsh web' % npx,
+                    shell=True,
+                    creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+                )
+                log("DeepSeek Harness 没在跑，已启动：%s web" % npx)
+            except Exception as exc:  # noqa: BLE001
+                log("启动 dsh 网页版失败：%r（改成直接开网页版）" % (exc,))
+                self.open_dsh_page(port)
+                self.invoke_on_pet(lambda: self._after(1.2, self._focus_dsh_browser, 4, 1.0))
+                return
+
+            self.wait_dsh_then_focus(port)
+        except Exception as exc:  # noqa: BLE001
+            log("打开 DeepSeek Harness 出错：%r" % (exc,))
+        finally:
+            self._dsh_opening = False      # 无论成功/失败/提前返回，都允许下次再点
 
     def open_dsh_page(self, port: int | None = None) -> None:
         """用默认浏览器打开 dsh 网页版（服务起来之前打开会连不上，所以只在已就绪时用）。"""
         port = self.dsh_web_port() if port is None else int(port)
+        now = time.time()
+        if now - getattr(self, "_last_dsh_page_open", 0.0) < 3.0:
+            log("3 秒内已开过一次网页版，跳过（防止连点把网页开成一排）")
+            return
+        self._last_dsh_page_open = now
         try:
             os.startfile("http://127.0.0.1:%d/" % port)  # noqa: S606
         except Exception as exc:  # noqa: BLE001
             log("打开 dsh 网页版失败：%r" % (exc,))
 
-    def wait_dsh_then_focus(self, port: int, left: int = 30) -> None:
-        """等 dsh web 起来（最多约 30 秒），起来后再把它的窗口置顶。"""
-        if self.dsh_web_running(port):
-            # 服务刚起来：把"在不在跑"的缓存作废，下一步找窗口立刻能看到它
-            self._dsh_ready_cache = None
-            log("dsh web 已就绪（端口 %d），正在找它的窗口" % port)
-            self._focus_dsh_browser(8, 0.9)
+    def wait_dsh_then_focus(self, port: int, seconds: float = 30.0) -> None:
+        """等 dsh web 起来（最多约 30 秒）再回到界面线程切窗口。
+
+        **只允许在后台线程调用**：这里用 time.sleep 轮询，每次一次 TCP 探测
+        （最长 0.35s）。以前它用 self._after 每秒在界面线程上重试，dsh 起不来时
+        界面线程被反复占住，鼠标就卡了。
+        """
+        deadline = time.time() + max(1.0, float(seconds))
+        while time.time() < deadline and not getattr(self, "_closing", False):
+            time.sleep(0.5)
+            if self.dsh_web_running(port):
+                self._dsh_ready_cache = None      # 作废缓存，找窗口时立刻能看到它
+                log("dsh web 已就绪（端口 %d），正在找它的窗口" % port)
+                self.invoke_on_pet(lambda: self._focus_dsh_browser(8, 0.9))
+                return
+        if getattr(self, "_closing", False):
             return
-        if left <= 1:
-            log("等了 30 秒 dsh web 还没起来（端口 %d），先不切窗口了；"
-                "可以看一下刚弹出的那个窗口里的报错" % port)
-            return
-        self._after(1.0, self.wait_dsh_then_focus, port, left - 1)
+        log("等了约 %.0f 秒 dsh web 还没起来（端口 %d），先不切窗口了；"
+            "可以看一下刚弹出的那个窗口里的报错" % (float(seconds), port))
 
     # -- 和 chat.deepseek.com 说话 -------------------------------------------
 
@@ -5122,6 +5368,10 @@ class PetHost:
                     # 想处理还可以去网页界面点。页面侧会记住这个申请 id，
                     # 同一个申请不会再自动弹回来（见 pet.js 的 approval.dismissedId）。
                     self.post({"t": "approval-dismiss"})
+                    # 队列里若还有别的申请，紧接着弹出来，别被这一条卡住
+                    watcher = getattr(self, "_approval_watcher", None)
+                    if watcher is not None:
+                        watcher.dismiss()
                     log("权限卡片已被手动收起（未回应，申请仍在 DSH 里）")
                 elif action == "approval-allow":
                     # 批准这次权限申请。**必须用 answer_async**：
@@ -6455,6 +6705,8 @@ class PetHost:
 
     def invoke_on_pet(self, fn) -> None:
         """把动作丢回桌宠的 UI 线程执行（跨线程碰 WinForms 会让界面无响应）。"""
+        if getattr(self, "_closing", False):
+            return                       # 已经在关闭：别再往已销毁的窗口投递
         form = getattr(self, "form", None)
         if form is None:
             fn()
@@ -6462,9 +6714,12 @@ class PetHost:
         try:
             from System import Action
 
+            if form.IsDisposed:
+                return
             form.BeginInvoke(Action(fn))
         except Exception:
-            fn()
+            if not getattr(self, "_closing", False):
+                fn()
 
     def apply_settings_ui(self) -> None:
         try:
@@ -6717,6 +6972,25 @@ def _gc_callback(phase: str, info) -> None:
             _gc_stat["max_ms"] = d
 
 
+def setup_gil() -> None:
+    """把 GIL 切换间隔调细（默认 5ms → 0.5ms）。
+
+    为什么要动这个：CPython 默认 sys.setswitchinterval(0.005)。本项目有好几个
+    后台线程（余额/用量 HTTP、DSH 权限 WebSocket、日志线程、钩子看门狗……），
+    某个线程持有 GIL 时，界面线程 —— 也正是 **低级鼠标钩子的宿主** —— 可能要
+    排队等最多 5ms 才能继续。低级钩子是系统级的：它晚返回，鼠标事件就晚到，
+    表现就是"偶尔、没有规律、日志里也看不出来"的卡顿。
+    调细之后这种排队上限降到十分之一；对整体吞吐的影响可以忽略。
+
+    注意：不要在钩子回调里做任何耗时操作（那条路径已经尽量精简），
+    这个函数只负责让"别的线程"别把界面线程卡太久。
+    """
+    try:
+        sys.setswitchinterval(0.0005)
+    except Exception as exc:  # noqa: BLE001
+        log("调整 GIL 切换间隔失败（不影响使用）：%r" % (exc,))
+
+
 def setup_gc() -> None:
     """把 GC 造成的全局停顿压下去（桌宠是长驻 GUI 程序，这点很要紧）。
 
@@ -6851,6 +7125,7 @@ def main() -> int:
         threading.Thread(target=state_loop, args=(host,), daemon=True).start()
         host.start_dsh_monitor()      # DSH 掉线时提示（可手动关闭），不自动重连
         host.start_approval_watch()   # 订阅 DSH 权限申请，需要批准时弹卡片
+        setup_gil()                   # GIL 切换间隔调细：别让后台线程拖住钩子所在的界面线程
         setup_gc()                    # 减少 GC 全局停顿（偶发鼠标停滞的元凶）
         if args.selftest:
             threading.Thread(target=lambda: (time.sleep(1.0), host.run_selftest(), Application.Exit()), daemon=True).start()
