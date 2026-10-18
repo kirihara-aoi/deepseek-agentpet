@@ -600,7 +600,6 @@ class MouseTracker:
         self.press_at = 0.0
         self.press_pos = (0, 0)
         self.press_on_char = False
-        self.press_on_head = False
         self.moved = 0.0
         self.dragging = False
 
@@ -648,7 +647,6 @@ class MouseTracker:
         self.press_at = now
         self.press_pos = (x, y)
         self.press_on_char = on_char
-        self.press_on_head = on_head
         self.moved = 0.0
         self.dragging = False
 
@@ -669,7 +667,6 @@ class MouseTracker:
             on_char = on_char_now or self.press_on_char
         else:
             on_char = on_char_now and self.press_on_char
-        on_head = self.press_on_head
 
         self.dragging = False
         self.press_button = ""
@@ -691,7 +688,8 @@ class MouseTracker:
             # 原来这里要等 SINGLE_CLICK_DELAY(0.35s) 看是不是双击，于是每次单击的
             # 反应都晚 350ms —— 用户反馈的"弹跳有明显迟滞感"就是这个。
             # 双击切换表情已经删掉了，这个等待没有任何意义了。
-            events.append("pat" if on_head else "poke")
+            # 摸头功能已删除：所有落在角色上的点击一律当「戳」
+            events.append("poke")
 
 
 def set_dpi_awareness() -> None:
@@ -964,7 +962,6 @@ class PetHost:
         self.last_cursor_send = 0.0
         self.last_stop_check = 0.0
         self.char_rect = None
-        self.head_rect = None
         self.web_dpr = None           # 网页自己报的 devicePixelRatio（换算光标坐标要用它，别用猜的）
         self.over_char = None
         self.alpha_probe_ok = False
@@ -1192,8 +1189,8 @@ class PetHost:
     def feed_tracker(self, x: float, y: float, left: bool, right: bool, on_char: bool) -> None:
         local_x = x - self.form.Left
         local_y = y - self.form.Top
-        on_head = on_char and self.on_head(local_x, local_y)
-        for event in self.mouse.feed(x, y, left, right, on_char, on_head, time.time()):
+        # 摸头已删除：不再计算头部区域
+        for event in self.mouse.feed(x, y, left, right, on_char, False, time.time()):
             self.on_mouse_event(event, wt.POINT(int(x), int(y)), time.time())
 
     def on_ui_mouse_down(self, sender, args) -> None:
@@ -1485,14 +1482,10 @@ class PetHost:
         kind = msg.get("t")
         if kind == "size":
             rect = msg.get("rect") or [0, 0, 0, 0]
-            head = msg.get("headRect") or None
             dpr = float(msg.get("dpr") or 1.0)
             if dpr > 0:
                 self.web_dpr = dpr
             self.char_rect = (rect[0] * dpr, rect[1] * dpr, rect[2] * dpr, rect[3] * dpr)
-            self.head_rect = (
-                (head[0] * dpr, head[1] * dpr, head[2] * dpr, head[3] * dpr) if head else None
-            )
             self.panel_open = bool(msg.get("panel"))
             chat_rect = msg.get("chatRect")
             self.chat_rect = (
@@ -1872,9 +1865,9 @@ class PetHost:
             # 按下已经在钩子里确认过“角色像素”，别让网页异步采样的滞后把这次拖动否掉。
             # 但按钮吞掉的点击不算：那个不是戳角色。
             on_char = inside and not locked and not self._left_swallow_for_button
-        on_head = on_char and self.on_head(local_x, local_y)
+        # 摸头已删除：不再计算头部区域
 
-        for event in self.mouse.feed(cursor.x, cursor.y, left, right, on_char, on_head, now):
+        for event in self.mouse.feed(cursor.x, cursor.y, left, right, on_char, False, now):
             self.on_mouse_event(event, cursor, now)
 
     def drain_hook_mouse_steps(self) -> None:
@@ -1898,8 +1891,7 @@ class PetHost:
             # DOWN 已经在钩子里确认过角色像素；UP 继续按“在角色上”处理，
             # 小幅抖到透明边缘时仍按项目原规则算一次点击，拖动则由 drag-end 收尾。
             on_char = True
-            on_head = left_down and self.on_head(local_x, local_y)
-            events = self.mouse.feed(x, y, left_down, False, on_char, on_head, at)
+            events = self.mouse.feed(x, y, left_down, False, on_char, False, at)
             cursor = wt.POINT(int(x), int(y))
             for event in events:
                 self.on_mouse_event(event, cursor, at)
@@ -2081,18 +2073,6 @@ class PetHost:
             return False
         return self.on_character(xy[0] - left, xy[1] - top)
 
-    def on_head(self, local_x: float, local_y: float) -> bool:
-        """头部区域：网页报了头框就用它，否则退回"角色上方 40%"。"""
-        rect = self.head_rect or (
-            (self.char_rect[0] + self.char_rect[2] * 0.2, self.char_rect[1], self.char_rect[2] * 0.6, self.char_rect[3] * 0.4)
-            if self.char_rect
-            else None
-        )
-        if rect is None:
-            return False
-        rx, ry, rw, rh = rect
-        return rx <= local_x <= rx + rw and ry <= local_y <= ry + rh
-
     def chat_zone_hit(self, local_x: float, local_y: float) -> bool:
         """点在网页里那个「说话」按钮上吗。
 
@@ -2140,11 +2120,11 @@ class PetHost:
         local_x = cursor.x - self.form.Left
         local_y = cursor.y - self.form.Top
         tool = self.tool_zone(local_x, local_y)
-        if event in ("pat", "poke"):
+        if event == "poke":
             if tool:
                 self.trigger_bottom_action(tool, "single", cursor)
             else:
-                self.post({"t": "react", "kind": "pat" if event == "pat" else "poke"})
+                self.post({"t": "react", "kind": "poke"})
         elif event == "cycle":
             if tool:
                 # 图标上双击也按单击处理：手感上"点一下就触发"最直接，
@@ -3153,7 +3133,6 @@ class PetHost:
             items = [
                 ("显示 / 隐藏任务进度", self.toggle_card),
                 ("刷新卡片信息", self.refresh_card_now),
-                ("摸头", lambda: self.post({"t": "react", "kind": "pat"})),
                 ("换个表情", lambda: self.post({"t": "cycle-expression"})),
                 ("随机动作", lambda: self.post({"t": "react", "kind": "motion"})),
                 ("-", None),

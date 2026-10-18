@@ -764,7 +764,6 @@ function reportHitbox() {
   const payload = {
     t: "size",
     rect: characterRect(),
-    headRect: headRect(),
     chatRect,
     bubbleRect,
     scrollUpRect: btnRect(ui.chatScrollUp),
@@ -790,17 +789,6 @@ function reportHitbox() {
   if (signature === lastHitboxSignature) return;
   lastHitboxSignature = signature;
   bridge.send(payload);
-}
-
-function headRect() {
-  const rect = characterRect();
-  if (!rect[2]) return null;
-  return [
-    Math.round(rect[0] + rect[2] * 0.18),
-    Math.round(rect[1] + rect[3] * 0.02),
-    Math.round(rect[2] * 0.64),
-    Math.round(rect[3] * 0.36),
-  ];
 }
 
 function reportFps() {
@@ -963,7 +951,10 @@ function onCursor(data) {
     const autoExpression = !state.settings || state.settings.autoExpression !== false;
     if (autoExpression && now - state.hoverSince > 2600 && now - state.lastShy > 22000 && Date.now() > state.tempUntil) {
       state.lastShy = now;
-      setTempExpression(pickAllowed(SHY_MOODS), 1.4);
+      const shyFace = pickAllowed(SHY_MOODS);
+      setTempExpression(shyFace, 1.4);
+      // 害羞到出爱心眼/心跳时，身边也冒一下爱心（和脸配套）
+      if (shyFace === "爱心眼" || shyFace === "心跳") heartBurst(1400);
       if (Math.random() < 0.5) playMotion("Tap");
     }
   } else {
@@ -1191,6 +1182,17 @@ function bounceScaleAt(t, k) {
     }
   }
   return [1, 1];
+}
+
+/** 立刻取消正在进行的弹跳，并把模型恢复成等比（拖拽开始时用）。 */
+function cancelBounce() {
+  if (!state.bounceAt) return;
+  state.bounceAt = 0;
+  const base = state.modelScale || 0;
+  if (!model || !base) return;
+  const baseH = (model.internalModel ? model.internalModel.height : 0) * base;
+  model.scale.set(base);
+  if (state.bounceBottom) model.y = state.bounceBottom - baseH;
 }
 
 function bounceModel(power) {
@@ -2373,16 +2375,8 @@ const POKE_BUSY = [
   { face: "脸红", w: 1.2, lines: ["唔…等我弄完再说", "（被戳得晃了一下，又低头看本子）"] },
   { face: "开心兴奋", w: 1.2, lines: ["知道啦知道啦", "（抬头笑一下，又埋头干活）", "在在在，人家听着呢"] },
   { face: "吐舌", w: 1.0, lines: ["忙着呢，不理你", "略，等会儿再说"] },
-  { face: "星星眼", w: 0.6, lines: ["！（笔掉了）", "吓人家一跳！"] },
-];
-
-// 摸头（宿主判定为头部区域）
-const POKE_HEAD = [
-  { face: "脸红", w: 1.6, fx: "heart", lines: ["不要突然摸头啦……再摸一下也不是不行。", "唔…头发要乱了啦", "（脸红）就、就一下哦", "哼，才没有很享受", "（尾巴尖偷偷晃了一下）"] },
-  { face: "开心兴奋", w: 1.4, lines: ["嘿嘿～主人", "嗯？叫人家吗", "在的在的", "摸摸头也不错嘛", "（眯着眼睛蹭了一下）"] },
-  { face: "爱心眼", w: 1.0, fx: "heart", lines: ["最喜欢主人了", "（冒爱心）", "（踮脚）还要！", "今天也最喜欢主人"] },
-  { face: "调皮", w: 1.0, lines: ["哼，就这一次哦", "才、才没有很开心", "别以为人家好哄", "（嘴上嫌弃，头却没躲）"] },
-  { face: "星星眼", w: 0.8, lines: ["（眼睛亮了一下）", "再摸一下？", "今天心情不错嘛"] },
+  { face: "感叹号", w: 0.8, lines: ["！（笔掉了）", "吓人家一跳！", "！（手一抖）"] },
+  { face: "问号", w: 0.8, lines: ["嗯？主人有什么事吗", "（从本子上抬眼看你）", "怎么啦怎么啦"] },
 ];
 
 // 戳身体
@@ -2390,20 +2384,24 @@ const POKE_BODY = [
   { face: "调皮", w: 1.3, lines: ["别戳啦", "痒！", "（躲了一下）", "手拿开啦", "戳我干嘛呀"] },
   { face: "吐舌", w: 1.1, lines: ["略略略", "就不理你", "（吐舌头）", "戳一下换一碗白饭，成交吗"] },
   { face: "脸红", w: 1.0, fx: "heart", lines: ["别、别戳那里啦", "唔…", "（往后缩了缩）"] },
-  { face: "开心兴奋", w: 1.0, lines: ["嗯？什么什么", "主人在叫人家吗", "（凑过来）"] },
+  // 爱心眼 + 身边冒爱心：摸头删掉后这个特效失去了主要来源，这里补回
+  { face: "爱心眼", w: 1.0, fx: "heart", lines: ["（身边冒出一串爱心）", "最喜欢主人了", "（冒爱心）", "（被戳得心花怒放）"] },
+  { face: "开心兴奋", w: 1.0, lines: ["哇！", "（被逗笑了）", "再来一下也行", "嘿嘿"] },
+  { face: "星星眼", w: 1.0, lines: ["（两眼发亮）", "嗯？有好吃的？", "（凑近了看）"] },
+  { face: "感叹号", w: 0.9, lines: ["！", "（吓一跳）", "！（整个人弹了一下）"] },
+  // "嗯？什么什么"原来放在"开心兴奋"里，明显是问号的脸，挪过来
+  { face: "问号", w: 0.9, lines: ["嗯？", "（歪头）什么什么？", "戳人家干嘛呀", "（一脸茫然）"] },
+  { face: "情绪花花", w: 0.5, lines: ["（脑袋上冒出小花）", "嘿嘿～", "（开心得冒花）"] },
   { face: "生气", w: 0.35, lines: ["再戳就生气了", "（气鼓鼓）", "说了别戳啦"] },
 ];
 
-// 摸头用的台词（从上面 POKE_HEAD 拍平；表情不再用，只要台词）
-const HEAD_LINES = POKE_HEAD.reduce((acc, it) => acc.concat(it.lines || []), []);
-
-// 手快被戳痒 / 真炸毛
 // 手快被戳痒：每个条目自带表情和对应台词（之前是"随机表情 + 通用台词"，
 // 于是会出现"脸红配一句生气的话"这种文不对脸的情况；鲸鱼娘插件是成对的）。
 const POKE_TICKLISH = [
   { face: "调皮", w: 1.3, lines: ["好痒！别戳这么快啦", "（缩成一团）", "别戳啦别戳啦"] },
   { face: "脸红", w: 1.1, lines: ["慢、慢一点啦", "（边躲边笑）", "唔…太痒了"] },
   { face: "吐舌", w: 0.9, lines: ["哈哈哈不要", "戳这么快想干嘛", "（笑得停不下来）"] },
+  { face: "问号", w: 0.6, lines: ["诶诶诶？", "（被戳懵了）", "等一下啦！"] },
 ];
 
 // 真炸毛：同样是成对的（生气多半，偶尔被戳晕）
@@ -2537,18 +2535,17 @@ function pokeReact() {
 }
 
 function reaction(kind) {
-  if (kind === "pat") {
-    // 摸头：只做爱心爆发 + 一句台词 + 弹一下，**不再改表情**（用户要求删除）
-    heartBurst(1500);
-    bounceModel(0.85);
-    toast(pickFreshFrom(HEAD_LINES, "head"));
-  } else if (kind === "poke") {
+  if (kind === "poke") {
     // 单击戳戳：连击分档 + 加权池（见 pokeReact）
     pokeReact();
   } else if (kind === "drag") {
-    // 拖拽：只记录状态，**不再改表情**（用户要求删除）
+    // 拖拽：不改表情、也不弹跳。
+    // 这里还要把"上一次戳的弹跳"取消掉 —— 否则拖的时候模型会带着半压扁的形变，
+    // 看起来像卡住/在抖（弹跳只有 460ms，连快点很容易撞上）。
+    cancelBounce();
   } else if (kind === "drop") {
-    bounceModel(0.7);            // 放下时弹一下就够了
+    // 放下：**不弹跳**（用户要求"拖拽不应触发弹跳效果"）。
+    // 弹跳只属于"戳"这类点按反馈，拖动/放下是连续动作，弹一下反而像卡了一下。
   } else if (kind === "motion") {
     playMotion(Math.random() < 0.5 ? "Tap" : "Show");
     setTempExpression(pickAllowed(MOOD_POOLS[state.key] || MOOD_POOLS.idle), 1.4);
