@@ -72,7 +72,10 @@ CARD_GAP = 4           # 卡片底部与"发梢/头顶"之间的空隙（CSS 像
 CARD_HEAD_TOP_RATIO = 0.18   # 卡片底边往下贴到模型高度的这个比例（压住头顶发丝，但不挡脸）
 CARD_COMPACT_BELOW = 0.6   # 桌宠缩放小于这个值就用紧凑卡片
 SCALE_MAX_WISH = 1.6       # 放大上限至少给到这里（以前按"不超过半屏"算，屏幕不高时只能到 120%~140%）
-SCALE_MIN = 0.30           # 缩小下限（2026-10-11 抬上来的：以前按"桌面图标大小"约 12%，太小没法用）
+SCALE_MIN = 0.46           # 缩小下限。
+# 为什么是 0.46：30% 时窗口只有 180x279，而提示/气泡/权限卡片的最小可用宽度
+# 约 200px、一条两三行的提示就要 120px 高 —— 结果卡片比窗口还宽、把按钮全盖住
+# （用户实测截图反馈过）。46% 对应 288x446，界面刚好还排得下。
 
 TOOL_BUTTONS = ("undo", "pencil", "eraser")
 TOOL_EVENTS = ("single", "right")   # 三个图标：单击触发功能、右键出对应菜单
@@ -589,8 +592,6 @@ class MouseTracker:
 
     DRAG_THRESHOLD = 5
     CLICK_MAX_SECONDS = 0.7
-    DOUBLE_CLICK_SECONDS = 0.35
-    SINGLE_CLICK_DELAY = 0.35
 
     def __init__(self) -> None:
         self.left_down = False
@@ -602,9 +603,6 @@ class MouseTracker:
         self.press_on_head = False
         self.moved = 0.0
         self.dragging = False
-        self.last_left_click = 0.0
-        self.pending_single = 0.0
-        self.pending_head = False
 
     def feed(self, x: float, y: float, left: bool, right: bool, on_char: bool, on_head: bool, now: float) -> list[str]:
         events: list[str] = []
@@ -633,12 +631,13 @@ class MouseTracker:
         return events
 
     def tick(self, now: float) -> list[str]:
-        """定时器每帧调用：把"等第二下"的单击判决定下来（否则单击永远不会触发）。"""
-        events: list[str] = []
-        if self.pending_single and now - self.pending_single > self.SINGLE_CLICK_DELAY:
-            self.pending_single = 0.0
-            events.append("pat" if self.pending_head else "poke")
-        return events
+        """定时器每帧调用。恒返回空列表。
+
+        历史：这里曾经负责把"还在等第二下"的单击判决定下来（那个 350ms 的延迟
+        就是用户反馈的"弹跳迟滞感"）。现在单击在松手时立刻派发，不再排队。
+        保留这个入口是因为调用方和外部诊断工具都还在用。
+        """
+        return []
 
     def _press(self, button: str, x: float, y: float, on_char: bool, on_head: bool, now: float) -> None:
         if button == "left":
@@ -687,14 +686,12 @@ class MouseTracker:
 
         if button == "right":
             events.append("menu")
-        elif self.pending_single and (now - self.last_left_click) < self.DOUBLE_CLICK_SECONDS:
-            self.pending_single = 0.0
-            self.last_left_click = 0.0
-            events.append("cycle")
         else:
-            self.last_left_click = now
-            self.pending_single = now
-            self.pending_head = on_head
+            # **立刻派发**，不再等第二下。
+            # 原来这里要等 SINGLE_CLICK_DELAY(0.35s) 看是不是双击，于是每次单击的
+            # 反应都晚 350ms —— 用户反馈的"弹跳有明显迟滞感"就是这个。
+            # 双击切换表情已经删掉了，这个等待没有任何意义了。
+            events.append("pat" if on_head else "poke")
 
 
 def set_dpi_awareness() -> None:
@@ -931,6 +928,9 @@ class PetHost:
         self.approval_allow_rect = None    # 卡片上「允许」按钮矩形
         self.approval_deny_rect = None     # 卡片上「拒绝」按钮矩形
         self.approval_close_rect = None    # 卡片右上角关闭键矩形
+        self.card_close_rect = None        # 进度卡片右上角关闭键矩形
+        self.card_btn_rect = None          # 「进度」按钮矩形
+        self.card_user_closed = False      # 用户手动关过卡片：本轮不再自动弹
         self._approval_watcher = None      # DSH 权限监听（懒启动，见 approval_watcher()）
         self.dsh_btn_rect = None           # 「切到 DSH 网页版」按钮矩形
         self.deepseek_btn_rect = None      # 「切到 chat.deepseek.com」按钮矩形
@@ -1056,6 +1056,9 @@ class PetHost:
         self._right_swallowed = False   # 这一次右键是不是已经被我们吃掉了
         self._left_swallowed = False    # 左键同理：按下/抬起都在钩子里成对吃掉
         self._left_swallow_log = False  # 吃掉左键的诊断标记，回到 tick 里再写日志
+        # 这次吃掉的左键是不是点在界面按钮上（说话/DSH/DS/进度/权限卡等）。
+        # 按钮点击绝不能再当成戳角色，否则点一下按钮也会触发戳的反应。
+        self._left_swallow_for_button = False
         self._ls_down_at = None         # 被吃掉的这次左键：按下位置（诊断/兜底用）
         self._ls_down_time = 0.0        # 被吃掉的这次左键：按下时刻
         self._hook_mouse_steps = []     # 钩子记录的左键 DOWN/UP 脉冲，tick 里按原顺序入状态机
@@ -1523,6 +1526,8 @@ class PetHost:
                 ("approvalAllowRect", "approval_allow_rect"),
                 ("approvalDenyRect", "approval_deny_rect"),
                 ("approvalCloseRect", "approval_close_rect"),
+                ("cardCloseRect", "card_close_rect"),
+                ("cardBtnRect", "card_btn_rect"),
                 ("dshBtnRect", "dsh_btn_rect"),
                 ("deepseekBtnRect", "deepseek_btn_rect"),
             ):
@@ -1636,6 +1641,13 @@ class PetHost:
             )
         elif kind == "error":
             log("页面报错：%s" % msg.get("message"))
+        elif kind == "card-state":
+            # 页面可能自己收起过卡片（比如来了回复气泡）：同步宿主的标记，
+            # 否则 inline_card_open 会一直为 True，"任务完成自动弹卡片"就再也不触发了。
+            new_open = bool(msg.get("open"))
+            if new_open != bool(getattr(self, "inline_card_open", False)):
+                self.inline_card_open = new_open
+                log("进度卡片状态同步：%s" % ("显示" if new_open else "隐藏"))
         elif kind == "snapshot":
             self.snapshot = msg.get("data") or ""
             self.snapshot_ready.set()
@@ -1836,14 +1848,12 @@ class PetHost:
             # 菜单开着（或刚被“点菜单外面”关掉）的这一下：鼠标操作归菜单和下层窗口，
             # 底层一律不判定 —— 否则菜单浮在哪，就会连带触发它下面的那个图标按钮
             # （点“重新载入形象”顺手触发橡皮擦，就是这么来的）。
-            self.mouse.pending_single = 0.0     # 丢掉排队中的单击，免得菜单一关就补触发
             return
         cursor = wt.POINT()
         user32.GetCursorPos(ctypes.byref(cursor))
         # 设置窗口、卡片、对话框等同进程窗口可能压在桌宠上面。它们的坐标仍落在
         # 桌宠矩形里，但输入必须归上层窗口；否则滑设置选项会同时缩放/拖动桌宠。
         if self.point_on_input_blocker((cursor.x, cursor.y)) and not self._left_swallowed and not self.mouse.dragging:
-            self.mouse.pending_single = 0.0
             return
         # 左键被钩子吞掉后 GetAsyncKeyState 不再可靠；用钩子维护的“逻辑按下状态”
         # 驱动原来的 MouseTracker。这样单击/双击/拖动状态机不用重写，也不会漏掉松手。
@@ -1860,7 +1870,8 @@ class PetHost:
         on_char = inside and not locked and self.on_character(local_x, local_y)
         if self._left_swallowed:
             # 按下已经在钩子里确认过“角色像素”，别让网页异步采样的滞后把这次拖动否掉。
-            on_char = inside and not locked
+            # 但按钮吞掉的点击不算：那个不是戳角色。
+            on_char = inside and not locked and not self._left_swallow_for_button
         on_head = on_char and self.on_head(local_x, local_y)
 
         for event in self.mouse.feed(cursor.x, cursor.y, left, right, on_char, on_head, now):
@@ -2140,7 +2151,8 @@ class PetHost:
                 # 万一习惯了双击也不会变成没反应
                 self.trigger_bottom_action(tool, "single", cursor)
             else:
-                self.post({"t": "cycle-expression"})
+                # 用户要求：删掉"双击切换表情"。双击不再做任何事（图标上双击仍按单击处理）。
+                pass
         elif event == "menu":
             if tool:
                 self.trigger_bottom_action(tool, "right", cursor)
@@ -2303,6 +2315,10 @@ class PetHost:
                             action = "approval-allow"
                         elif self.approval_deny_rect and self.point_in_rect(self.approval_deny_rect, s_xy[0], s_xy[1]):
                             action = "approval-deny"
+                        elif self.card_close_rect and self.point_in_rect(self.card_close_rect, s_xy[0], s_xy[1]):
+                            action = "card-close"
+                        elif self.card_btn_rect and self.point_in_rect(self.card_btn_rect, s_xy[0], s_xy[1]):
+                            action = "card-key"
                         elif self.notice_close_rect and self.point_in_rect(self.notice_close_rect, s_xy[0], s_xy[1]):
                             action = "notice-close"
                         elif self.chat_scroll_up_rect and self.point_in_rect(self.chat_scroll_up_rect, s_xy[0], s_xy[1]):
@@ -2318,6 +2334,7 @@ class PetHost:
                         if action:
                             self._pet_btn_click.append((action, time.time()))
                             self._left_swallowed = True
+                            self._left_swallow_for_button = True
                             self._ls_down_at = s_xy
                             self._ls_down_time = time.time()
                             # 按下反馈要**立刻**发（钩子回调里只准发消息、不做业务）：
@@ -2330,6 +2347,8 @@ class PetHost:
                                 "approval-allow": "approval-allow",
                                 "approval-deny": "approval-deny",
                                 "approval-close": "approval-close",
+                                "card-close": "card-close",
+                                "card-key": "card-key",
                             }.get(action)
                             if name:
                                 self._pet_btn_pressed = name
@@ -2354,6 +2373,7 @@ class PetHost:
                             self._chat_button_click.append(("left" if wparam == WM_LBUTTONDOWN else "right", time.time()))
                             if wparam == WM_LBUTTONDOWN:
                                 self._left_swallowed = True
+                                self._left_swallow_for_button = True
                                 self._ls_down_at = btn_xy
                                 self._ls_down_time = time.time()
                                 # 按下反馈（说话按钮同样由钩子命中，网页收不到点击）
@@ -2377,9 +2397,15 @@ class PetHost:
                         # 松开：把按钮弹回来（真正的"按下去→弹起来"）
                         self.post({"t": "pet-btn-press", "which": self._pet_btn_pressed, "on": False})
                         self._pet_btn_pressed = None
+                    for_button = self._left_swallow_for_button
                     self._left_swallowed = False
+                    self._left_swallow_for_button = False
                     self._ls_down_at = None
-                    self._hook_mouse_steps.append(("up", up_xy or (0, 0), now))
+                    # 按钮点击到此为止：不要再塞 up 步。
+                    # 之前无条件塞了，MouseTracker 收到一个没有 down 的 up，
+                    # 就当成在角色上点了一下，于是点按钮也会触发戳的反应。
+                    if not for_button:
+                        self._hook_mouse_steps.append(("up", up_xy or (0, 0), now))
                     return 1
                 if wparam == WM_RBUTTONDOWN and not self._menu_visible and self.pointer_on_pet():
                     # 事件被吃掉之后，GetAsyncKeyState 那边可能就看不到这次按键了，
@@ -2424,7 +2450,13 @@ class PetHost:
                             return 1
                         except Exception:
                             pass
-            return user32.CallNextHookEx(None, code, wparam, lparam)
+            # CallNextHookEx 的 restype 是 c_void_p：它返回 0（钩子链没有下一个时就是 0）
+            # 时 ctypes 会给 None，而回调必须返回整数 —— 于是每个鼠标事件都抛一次
+            # TypeError 并被 ctypes 打到 stderr。异常格式化 + 写文件的开销非常大，
+            # 表现就是"鼠标一动就卡"，而且 stderr 会疯狂膨胀。
+            # 这里统一转成 int 再返回。
+            _res = user32.CallNextHookEx(None, code, wparam, lparam)
+            return 0 if _res is None else int(_res)
 
         # 真正注册钩子。下面这四行**必须保留**：
         #   · HOOKPROC 对象要存到 self 上，否则被 GC 回收后回调就崩；
@@ -2488,6 +2520,7 @@ class PetHost:
                         # 钩子一旦被摘，成对的 UP 可能永远收不到。清掉钩子侧按钮状态，
                         # 让下一次 tick 把 MouseTracker / 拖动状态正常释放。
                         self._left_swallowed = False
+                        self._left_swallow_for_button = False
                         self._right_swallowed = False
                         user32.UnhookWindowsHookEx(ctypes.c_void_p(handle))
                         log("看门狗：界面线程卡住超过 2 秒（最后在做：%s），已临时摘掉鼠标钩子（鼠标应当立刻恢复）" % self._ui_phase)
@@ -2762,6 +2795,22 @@ class PetHost:
             settings_store.save(self.settings)
         except Exception as exc:  # noqa: BLE001
             log("保存进度卡片状态失败：%r" % (exc,))
+
+    def notify_task_done(self) -> None:
+        """任务刚完成：自动展开进度卡片，让用户直接看到结果。
+
+        用户点 ✕ 关掉过就不再自动弹（`card_user_closed`），下一个任务开始时
+        会在 state_loop 里清掉这个标记。
+        """
+        if getattr(self, "card_user_closed", False):
+            return
+        if getattr(self, "inline_card_open", False):
+            return                      # 本来就开着，不用重复
+        try:
+            self.toggle_card(True)
+            log("任务完成：自动展开进度卡片")
+        except Exception as exc:  # noqa: BLE001
+            log("自动展开进度卡片失败：%r" % (exc,))
 
     def toggle_card(self, show=None) -> None:
         """任务进度卡片。
@@ -5019,6 +5068,8 @@ class PetHost:
             margin = 4.0 * float(getattr(self, "web_dpr", 1.0) or 1.0)
             for which, attr in (
                 ("approval-close", "approval_close_rect"),
+                ("card-close", "card_close_rect"),
+                ("card-key", "card_btn_rect"),
                 ("approval-allow", "approval_allow_rect"),
                 ("approval-deny", "approval_deny_rect"),
                 ("notice-close", "notice_close_rect"),
@@ -5078,6 +5129,15 @@ class PetHost:
                     self._notice_key = ""
                     self._notice_user_closed = True
                     log("提示已被手动关闭")
+                elif action == "card-close":
+                    # 用户点 ✕ 收起卡片：本轮不再自动弹（任务完成时也不弹），
+                    # 直到下一个任务开始（见 state_loop 里的状态跃迁）
+                    self.card_user_closed = True
+                    self.toggle_card(False)
+                    log("进度卡片已被手动收起")
+                elif action == "card-key":
+                    log("按钮：打开/收起任务进度卡片")
+                    self.toggle_card()
                 elif action == "approval-close":
                     # 只收起卡片，**不代替用户回应**：申请仍留在 DSH 里，
                     # 想处理还可以去网页界面点。页面侧会记住这个申请 id，
@@ -6574,6 +6634,77 @@ class PetHost:
 # -------------------------------------------------------------------- state feed
 
 
+# 余额缓存：{端口: (取到的时间, 显示文本)}。60 秒一次，别把状态循环拖慢。
+_HUD_CACHE = {}
+_HUD_LOGGED = None
+# 缓存时间：原来 60 秒，用户反馈"余额更新太慢"，收到 10 秒。
+# 这是一次本机 HTTP（4 秒超时、失败静默），10 秒一次的开销可以忽略。
+_HUD_TTL = 10.0
+
+
+def hud_info(port: int) -> dict:
+    """读 DSH 的 /dsh-pet/hud，返回 {"balance": "¥9.96", "usage": "今日 ¥0.12 / 本轮 ¥0.03"}。
+
+    为什么要宿主去读：桌宠页面是自己的随机端口，跨域取不到 DSH 的接口。
+    `/dsh-pet/hud` 需要浏览器会话 cookie，这里复用 dsh_approval 里的自签方案。
+    读不到就返回空字典，绝不影响状态循环。
+    """
+    now = time.time()
+    cached = _HUD_CACHE.get(port)
+    if cached and now - cached[0] < _HUD_TTL:
+        return cached[1]
+    info = {}
+    try:
+        import http.client
+
+        secret = dsh_approval.load_cookie_secret()
+        headers = {}
+        if secret:
+            headers["Cookie"] = dsh_approval.make_cookie("127.0.0.1:%d" % port, secret)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=4.0)
+        conn.request("GET", "/dsh-pet/hud", headers=headers)
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", "replace")
+        conn.close()
+        if resp.status == 200:
+            data = json.loads(body)
+            bal = data.get("balance") or {}
+            total = bal.get("totalBalance")
+            cur = str(bal.get("currency") or "CNY")
+            sym = {"CNY": "¥", "USD": "$"}.get(cur, cur + " ")
+            if bal.get("ok") is not False and total is not None:
+                info["balance"] = "%s%.2f" % (sym, float(total))
+            # 金额口径：today.amount（今日）/ turn.amount（刚结束的那一轮）
+            parts = []
+            today = data.get("today") or {}
+            if today.get("amount") is not None:
+                parts.append("今日 %s%.2f" % (sym, float(today["amount"])))
+            turn = data.get("turn") or {}
+            if turn.get("amount") is not None:
+                parts.append("本轮 %s%.2f" % (sym, float(turn["amount"])))
+            if parts:
+                info["usage"] = " / ".join(parts)
+    except Exception:  # noqa: BLE001
+        info = {}            # 读不到就不显示，别在状态循环里刷错误日志
+    _HUD_CACHE[port] = (now, info)
+    global _HUD_LOGGED
+    summary = "%s | %s" % (info.get("balance") or "—", info.get("usage") or "—")
+    if _HUD_LOGGED != summary:
+        _HUD_LOGGED = summary
+        log("HUD：余额 %s，%s" % (info.get("balance") or "读不到", info.get("usage") or "用量读不到"))
+    return info
+
+
+def balance_line(port: int) -> str:
+    """从 DSH 的 /dsh-pet/hud 读 API 余额，返回 "¥10.27" 这种短文本。
+
+    为什么要宿主去读：桌宠页面是自己的随机端口，跨域取不到 DSH 的接口。
+    `/dsh-pet/hud` 需要浏览器会话 cookie，这里复用 dsh_approval 里的自签方案。
+    失败就返回空串（卡片上不显示），绝不影响状态循环。
+    """
+    return hud_info(port).get("balance", "")
+
+
 def usage_line(host: PetHost) -> str:
     """进度卡片右下角那行小字：今日新增 / 本会话累积（设置里可切、可关）。
 
@@ -6643,6 +6774,7 @@ def state_loop(host: PetHost, interval: float = 1.0) -> None:
     last_send = 0.0
     last_tick = 0.0
     agent_id = ""
+    last_state_key = ""
     while True:
         try:
             agent_id = str((host.settings or {}).get("agent") or "codex")
@@ -6651,6 +6783,23 @@ def state_loop(host: PetHost, interval: float = 1.0) -> None:
             log("读取 %s 状态失败：%r" % (agent_id or "Agent", exc,))
             payload = {"state": "idle", "label": "空闲", "title": "", "activity": ""}
         payload["usage"] = usage_line(host)      # 卡片右下角那行小字（今日新增 / 本会话累积）
+        # 余额 + 今日/本轮消费（10 秒缓存）：卡片右上角显示余额，
+        # 底部那行改成金额（原来显示的是 token 数，用户更想看花了多少钱）
+        try:
+            _hud = hud_info(host.dsh_web_port())
+        except Exception:  # noqa: BLE001
+            _hud = {}
+        payload["balance"] = _hud.get("balance") or ""
+        if _hud.get("usage"):
+            payload["usage"] = _hud["usage"]
+        # 状态跃迁：①任务刚完成 → 自动弹卡片；②有新任务开始 → 清掉"用户已关闭"标记
+        cur_key = str(payload.get("state") or "")
+        if cur_key != last_state_key:
+            if cur_key == "done" and last_state_key in ("thinking", "working", "review", "syncing"):
+                host.notify_task_done()
+            elif cur_key in ("thinking", "working"):
+                host.card_user_closed = False
+            last_state_key = cur_key
         trimmed = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         host.last_payload = payload
         host.schedule_card_update(payload)

@@ -27,6 +27,13 @@
           "FadeInTime": 0.6,
           "FadeOutTime": 0.6
         }
+      ],
+      "Splash": [
+        {
+          "File": "motions/喷水.motion3.json",
+          "FadeInTime": 0.25,
+          "FadeOutTime": 0.45
+        }
       ]
     },
     "Expressions": [

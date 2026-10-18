@@ -9,7 +9,7 @@ const STATE_STYLE = {
   syncing: { label: "同步中", color: "#4fc3d9", expr: "流汗", motion: null },
   blocked: { label: "被挡住", color: "#ff6b6b", expr: "生气", motion: null },
   error: { label: "出错了", color: "#ff4d4d", expr: "哭", motion: null },
-  done: { label: "完成了", color: "#ffd166", expr: "爱心眼", motion: "Show" },
+  done: { label: "完成了", color: "#ffd166", expr: null, motion: "Show" },   // 不再做爱心眼庆祝
   interrupted: { label: "被打断", color: "#9b9b9b", expr: "悲伤", motion: null },
 };
 
@@ -25,15 +25,11 @@ const MOOD_POOLS = {
   syncing: ["流汗", "心跳"],
   blocked: ["生气", "阴暗"],
   error: ["哭", "悲伤", "流汗"],
-  done: ["爱心眼", "星星眼", "开心兴奋"],
+  done: ["呆呆眼", "脸红", "调皮", "吐舌"],   // 完成不再庆祝，用平常脸
   interrupted: ["悲伤", "流汗"],
 };
 
-const DRAG_MOODS = ["开心兴奋", "调皮", "脸红", "生气", "吐舌"];
-const DROP_MOODS = ["爱心眼", "生气", "星星眼"];
-const POKE_MOODS = ["调皮", "吐舌", "脸红", "星星眼", "开心兴奋"];
 const SHY_MOODS = ["脸红", "心跳", "爱心眼"];
-const PAT_MOODS = ["脸红", "爱心眼", "开心兴奋", "星星眼"];
 
 const MOOD_CHECK_MS = 2500;      // 多久检查一次"该不该换表情"
 const DEFAULT_MOOD_SECONDS = 11; // 用户可调
@@ -94,6 +90,8 @@ const ui = {
   chipText: el("chip-text"),
   chipDot: el("chip-dot"),
   toast: el("toast"),
+  cardClose: el("card-close"),
+  cardBtn: el("card-btn"),
   notice: el("notice"),
   noticeTitle: el("notice-title"),
   noticeBody: el("notice-body"),
@@ -117,6 +115,7 @@ const ui = {
   cardActivityText: el("card-activity-text"),
   cardSay: el("card-say"),
   cardUsage: el("card-usage"),
+  cardBalance: el("card-balance"),
   chatBubble: el("chat-bubble"),
   chatBubbleBody: el("chat-bubble-body"),
   chatBubbleFoot: el("chat-bubble-foot"),
@@ -390,6 +389,8 @@ async function boot() {
   setInterval(reportHitbox, 220);
   setInterval(scheduleIdle, 2000);
   setInterval(moodTick, MOOD_CHECK_MS);
+  // 临时表情（抚摸/拖拽）到期自动复原
+  setInterval(tempExprTick, MOOD_CHECK_MS);
   setInterval(reportFps, 3000);
   // 优先级：模型自身更新是 0，渲染是 LOW(25)。
   // 视线/道具屏蔽写在 10、11 —— 都在"模型更新之后、渲染之前"，这样才不会被动作覆盖。
@@ -476,8 +477,45 @@ function expressionNames() {
   return (state.settings && state.settings.availableExpressions) || [];
 }
 
+// 上一次布局的输入签名。ResizeObserver、状态推送、设置变更都会调 layout()，
+// 而它们的输入往往没变（例如卡片内容微调但高度分桶后相同）—— 这时重排纯属浪费，
+// 每次重排都要读一堆 getBoundingClientRect 并重设模型变换，正是"卡一下"的来源。
+let layoutSignature = "";
+// 上一次上报的命中矩形签名：没变化就不再发消息（每 220ms 一次，省下大量无意义的
+// WebView2 消息与宿主侧更新）
+let lastHitboxSignature = "";
+
+/**
+ * 模型还没加载完时的按钮兜底位置。
+ *
+ * 这些按钮是 `position:absolute`，在没有 left/top 的情况下会停在"静态位置"——
+ * 也就是窗口左上角那一小块。表现就是用户看到的"刚打开时按钮飞到左上角"。
+ * 这里先按"底部居中"摆好，等模型就绪后 layout() 会再按模型位置精确摆一次。
+ */
+function placeButtonsFallback() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  const nodes = [ui.chatBtn, ui.dshBtn, ui.deepseekBtn, ui.cardBtn].filter(
+    (n) => n && !n.classList.contains("hidden")
+  );
+  if (!nodes.length) return;
+  const bw = 34.0;
+  const bgap = 10.0;
+  const totalW = nodes.length * bw + (nodes.length - 1) * bgap;
+  let x = (w - totalW) / 2.0;
+  const y = Math.max(4, h - 34 - 24);
+  for (const n of nodes) {
+    n.style.left = `${Math.round(x)}px`;
+    n.style.top = `${Math.round(y)}px`;
+    x += bw + bgap;
+  }
+}
+
 function layout() {
-  if (!model) return;
+  if (!model) {
+    placeButtonsFallback();     // 模型没就绪：别让按钮停在左上角
+    return;
+  }
   const w = window.innerWidth;
   const h = window.innerHeight;
   const maxW = w * 0.96;
@@ -503,11 +541,16 @@ function layout() {
   const BUBBLE_FIXED_H = bubbleBodyMax + bubbleChrome;
   const CARD_EST_H = 118;                      // 进度卡片高度（含内边距）的保守估计
   const btnH = 34;                             // 底部那排按钮高度
+  // 模型底边到按钮行的距离。用户要求"按钮和反应文字一起上移"，
+  // 所以这里回到 8px（按钮贴回模型脚下、模型恢复原来大小）；
+  // 反应文字改成挂在**按钮上方**，允许压住模型下沿一点（用户明确说没关系）。
   const btnGap = 8;
   // 桌宠窗口的下沿可能被任务栏/屏幕边缘挡住，这里按比例预留一块底部安全区。
   // 另外模型 bounds 不一定包含全部可见画面（还有装饰/特效层），所以再补一段固定余量，
   // 让按钮确实落在画面下方而不是压在身上。
-  const bottomSafe = Math.max(24, Math.round(h * 0.11)) + 64;
+  // 底部安全区：原来 11% + 64px（在 682 高的窗口里就是 139px）远超实际需要 ——
+  // 那排按钮只有 34px 高，过大的预留会直接把模型压小。现在按 4% + 34px。
+  const bottomSafe = Math.max(16, Math.round(h * 0.04)) + 34;
 
   // —— 坐标约定（重要，踩过坑）——
   // window.innerWidth/innerHeight 与元素 getBoundingClientRect() **本来就是同一套
@@ -516,7 +559,62 @@ function layout() {
   // 曾经把 innerHeight 当"物理像素"而 rect 当"CSS 像素"，来回换算 dpr 一次，
   // 结果按钮被推到模型正中间、还压在身上（实测踩过）。dpr 只用来做像素命中判断，
   // 跟这里的排版无关。
-  const cardH = cardOpen ? Math.max(0, Math.round(ui.card.getBoundingClientRect().height)) : 0;
+  // 卡片"能占多少位置"要封顶：卡片内容一多（长标题/长的一句话）就会长很高，
+  // 把模型压到只剩一百多像素。超过 130px 的部分让它压在模型上方（视觉上仍完整
+  // 显示，只是不再继续压缩模型）。
+  // —— 卡片绝不盖住模型 ——
+  // 卡片是固定 CSS 尺寸、不跟窗口缩放；桌宠缩小后"模型上方那条带子"变窄，
+  // 卡片会压到模型身上。这里按可用高度把卡片字号系数(state.cardFit)往下调。
+  //
+  // **注意：这里绝对不能递归调用 layout()**（上一版就是那样写的，结果外层这次
+  // 调用直接 return、永远走不到下面的模型缩放，缩放功能整个坏掉）。
+  // 改成"原地调系数 + 重新量几次"，最多 4 轮，然后继续往下走。
+  if (cardOpen) {
+    const avail = Math.max(72, Math.round(model.y - 10));
+    for (let i = 0; i < 4; i += 1) {
+      const h = ui.card.getBoundingClientRect().height;
+      if (h <= avail) break;                       // 装得下了
+      const cur = state.cardFit || 1;
+      const want = Math.max(0.62, cur * (avail / h) * 0.98);
+      if (Math.abs(want - cur) <= 0.02) break;     // 收敛了，别再动
+      state.cardFit = want;
+      applyCardScale();                            // 改字号 → 下次循环重新量高度
+    }
+    // 空间又够了就慢慢恢复回 1（每次最多 +0.06，避免来回跳）
+    if ((state.cardFit || 1) < 0.995) {
+      const h = ui.card.getBoundingClientRect().height;
+      if (h < avail * 0.92) {
+        state.cardFit = Math.min(1, (state.cardFit || 1) + 0.06);
+        applyCardScale();
+      }
+    }
+  }
+
+  const cardH = cardOpen
+    ? Math.min(130, Math.max(0, Math.round(ui.card.getBoundingClientRect().height)))
+    : 0;
+
+  // 先把"还没有任何位置"的可见按钮摆到兜底位置。
+  // 这一步必须在下面的"提前返回"**之前**：宿主是后把 说话/DSH/DS 按钮切显示出来的，
+  // 如果签名没变就直接返回，这些新出现的按钮会停在窗口左上角（绝对定位的静态位置）。
+  const allBtns = [ui.chatBtn, ui.dshBtn, ui.deepseekBtn, ui.cardBtn];
+  if (allBtns.some((n) => n && !n.classList.contains("hidden") && !n.style.left)) {
+    placeButtonsFallback();
+  }
+
+  // 输入没变就跳过整趟重排。签名要覆盖**影响布局结果的一切**，包括按钮显隐 ——
+  // 漏掉它就会出现"按钮刚显示出来却没有被摆位"。
+  const btnSig = allBtns
+    .map((n) => (n && !n.classList.contains("hidden") ? 1 : 0))
+    .join("");
+  // 气泡的实际高度也要进签名：它随内容增长，高度一变就必须重新对齐
+  // （否则气泡会用自己的旧高度算位置，长出来以后压住模型）。
+  const bubbleH = bubbleOpen ? Math.round(ui.chatBubble.getBoundingClientRect().height) : 0;
+  const signature = [
+    w, h, cardOpen ? 1 : 0, cardH, bubbleOpen ? 1 : 0, bubbleH, gap, btnSig,
+  ].join("|");
+  if (signature === layoutSignature) return;
+  layoutSignature = signature;
 
   // —— 模型缩放怎么定 ——
   // 两条要求合起来：①桌宠大小**不能因为气泡出现而变化**（否则观感像在跳）；
@@ -524,11 +622,14 @@ function layout() {
   // 有没有气泡，桌宠都是这个大小，气泡出现时正好落在上面预留的位置里。
   // （曾经只按窗口算缩放、让气泡压在模型上，用户反馈"不要盖住模型"。）
   const reserveBottom = btnH + btnGap + bottomSafe;
-  const cardReserve = cardOpen ? cardH + gap : 0;
+  // **卡片不参与模型缩放预算**：加进去的话，每次开合卡片模型都要重新缩放一次，
+  // 观感上就是"一开卡片模型就缩小"（用户明确不要）。卡片占用的是"气泡预留"那条
+  // 带子（顶部 182px），足够放下卡片，所以去掉它模型大小和位置都不变。
   const bubbleReserve = BUBBLE_FIXED_H + 8;    // 顶部固定留给气泡的那条
-  const reserveTop = cardReserve + bubbleReserve;
+  const reserveTop = bubbleReserve;
   const maxH = Math.max(60, h - reserveTop - reserveBottom);
   const scale = Math.min(maxW / model.internalModel.width, maxH / model.internalModel.height);
+  state.modelScale = scale;   // 弹跳特效要基于这个基础值做压扁/拉伸
   model.scale.set(scale);
   model.x = (w - model.width) / 2;
   // 角色贴在预留区下方（气泡出现时它不动），卡片打开时才整体下移让位
@@ -549,10 +650,14 @@ function layout() {
     cursor += cardH + gap;
   }
   if (bubbleOpen) {
-    // 气泡落在**为它预留的那条位置**里：底边紧贴模型上方（留 6px 间隙）。
-    // 模型位置是照这个预算算出来的，所以这里不会再压到模型。
-    const aboveHead = model.y - BUBBLE_FIXED_H - 6;
-    ui.chatBubble.style.top = `${Math.round(Math.max(cursor, aboveHead, 2))}px`;
+    // 气泡**底边紧贴模型顶边**（留 8px 间隙），并且用**实际高度**算。
+    // 原来用的是常量 BUBBLE_FIXED_H，导致：①气泡内容短时被顶到窗口最上面、
+    // 离模型老远；②模型缩放后模型 y 一变，气泡相对模型的距离就跟着变（实测
+    // 135px → 76.5px，用户看到的就是"气泡相对模型严重位移"）。
+    // 改成按实际高度对齐后，无论内容多长、模型多大，间隙恒定。
+    const bubbleActualH = ui.chatBubble.getBoundingClientRect().height;
+    const aboveHead = model.y - bubbleActualH - 8;
+    ui.chatBubble.style.top = `${Math.round(Math.max(2, aboveHead))}px`;
   }
   // 底部那排按钮：落在角色脚下那条空白里（同一套视口坐标，不做 dpr 换算）
   const placeRow = (nodes) => {
@@ -570,7 +675,7 @@ function layout() {
       x += bw + bgap;
     }
   };
-  placeRow([ui.chatBtn, ui.dshBtn, ui.deepseekBtn]);
+  placeRow([ui.chatBtn, ui.dshBtn, ui.deepseekBtn, ui.cardBtn]);
   // 排查用：把这次布局的关键数字记下来（window.__petLayout 可被读出来核对）
   window.__petLayout = {
     window: [w, h],
@@ -585,6 +690,8 @@ function layout() {
     btnTop: Math.round(ui.chatBtn ? ui.chatBtn.getBoundingClientRect().top : 0),
   };
   reportHitbox();
+  // 反应文字（toast）落在"模型底部与按钮之间"的空隙里
+  positionToast();
   // 常驻提示跟气泡一样是绝对定位，布局时重新摆一下（模型缩放/窗口变化都要跟）
   if (notice.open) noticePosition();
   // 权限申请卡片同理：窗口被拖动/缩放时要始终贴着模型上方
@@ -601,7 +708,13 @@ function applyCardScale() {
   const base = (state.settings && state.settings.baseSize) || [400, 620];
   const petScale = base[0] ? window.innerWidth / base[0] : 1;
   const linked = !state.settings || state.settings.cardScaleWithPet !== false;
-  const value = linked ? Math.min(1.45, Math.max(0.85, 1 + (petScale - 1) * 0.6)) : 1;
+  // 上限收到 1.0：桌宠放大时卡片原来会跟着涨到 1.45 倍，字号/内边距一起变大，
+  // 卡片又高又占地方（用户反馈"卡片过大、把模型压缩得特别小"）。保持 1.0 上限，
+  // 只允许在小桌宠时缩一点。
+  // 再缩一点点（乘 0.94）：卡片整体更紧凑，少占地方
+  const rawScale = linked ? Math.min(1.0, Math.max(0.85, 1 + (petScale - 1) * 0.6)) : 1;
+  // 再乘上 layout() 算出的"要塞进模型上方那条带子"的系数（state.cardFit）
+  const value = rawScale * 0.94 * (state.cardFit || 1);
   if (ui.card) ui.card.style.setProperty("--card-scale", value.toFixed(3));
 }
 
@@ -648,7 +761,7 @@ function reportHitbox() {
     if (!node || node.classList.contains("hidden")) return null;
     return btnRect(node);
   };
-  bridge.send({
+  const payload = {
     t: "size",
     rect: characterRect(),
     headRect: headRect(),
@@ -667,8 +780,16 @@ function reportHitbox() {
     approvalCloseRect: approval.open ? btnRect(ui.approvalClose) : null,
     dshBtnRect: keyRect(ui.dshBtn),
     deepseekBtnRect: keyRect(ui.deepseekBtn),
+    // 任务进度卡片：关闭键 + 第 4 个按钮（都由宿主钩子命中）
+    cardCloseRect: state.cardOpen ? btnRect(ui.cardClose) : null,
+    cardBtnRect: keyRect(ui.cardBtn),
     dpr: window.devicePixelRatio || 1,
-  });
+  };
+  // 完全没变化就不发：鼠标静止时这份数据是死的，每 220ms 发一次纯属浪费
+  const signature = JSON.stringify(payload);
+  if (signature === lastHitboxSignature) return;
+  lastHitboxSignature = signature;
+  bridge.send(payload);
 }
 
 function headRect() {
@@ -775,6 +896,34 @@ function setTempExpression(name, seconds) {
   return true;
 }
 
+/**
+ * 临时表情到点复原。
+ *
+ * 以前 setTempExpression 只写了一个"截止时间"，**没有任何地方负责到点复原** ——
+ * 抚摸/拖拽设的表情会一直挂着，只有等下一次状态更新或下一次随机心情才可能换掉，
+ * 于是看起来就是"表情卡住不复原"（用户反馈）。这里补上到期还原。
+ */
+function tempExprTick() {
+  if (!state.tempExpr) return;
+  if (Date.now() < state.tempUntil) return;
+  state.tempExpr = null;
+  state.tempUntil = 0;
+
+  // **必须先把 state.expression 清空、并 resetExpression()**，再应用基础表情：
+  //   · setExpression 有"name === state.expression 就 return"的短路；
+  //   · 有些表情（脸红 / 爱心眼 / 吐舌 这类改参数或叠加的）在表达式管理器里
+  //     并不会被"设置另一个表情"真正顶掉，只靠 setExpression 会残留 ——
+  //     这就是"表情卡住不恢复"的根源。
+  // 清空标记 + 显式 reset 之后，无论基础表情是什么都能真正生效。
+  state.expression = null;
+  resetExpression();
+
+  const base = exprFor(state.key);
+  if (base) setExpression(base);
+  // 复原后先安静一会儿，别立刻又被随机心情换掉，否则看着像"复原失败"
+  state.moodAt = Date.now();
+}
+
 function moodTick() {
   if (!model) return;
   if (state.settings && state.settings.autoExpression === false) return;
@@ -814,7 +963,7 @@ function onCursor(data) {
     const autoExpression = !state.settings || state.settings.autoExpression !== false;
     if (autoExpression && now - state.hoverSince > 2600 && now - state.lastShy > 22000 && Date.now() > state.tempUntil) {
       state.lastShy = now;
-      setTempExpression(pickAllowed(SHY_MOODS), 3.2);
+      setTempExpression(pickAllowed(SHY_MOODS), 1.4);
       if (Math.random() < 0.5) playMotion("Tap");
     }
   } else {
@@ -940,6 +1089,142 @@ function clamp(value, low, high) {
   return Math.min(high, Math.max(low, value));
 }
 
+/**
+ * 爱心爆发（摸头特效），对齐鲸鱼娘插件的实现：
+ *
+ * 模型自带 `love`（爱心粒子）和 `ParamCheek73`（爱心/心跳）两条参数，它们属于
+ * "通用动画(循环)"组 —— 只要把它们顶到 1，爱心就会持续冒；松手自然停。
+ * 鲸鱼娘是每帧写这两个参数、持续 2.2 秒，这里照做（比换表情更"有特效感"）。
+ *
+ * 注意：写参数必须**每帧**做（模型的参数每帧会被动作/表情重置），
+ * 所以真正落笔在 applyGazeParameters 里（那里本来就跑在共享 ticker 上）。
+ */
+function heartBurst(ms) {
+  state.heartBurstUntil = performance.now() + (ms || 2200);
+}
+
+function heartBurstTick(core, now) {
+  const until = state.heartBurstUntil || 0;
+  if (until && now <= until) {
+    setParam(core, "love", 1);
+    setParam(core, "ParamCheek73", 1);
+    // 记着"结束后要写几帧 0"。Live2D 的参数**不会自动归零** —— 如果只是不写了，
+    // 爱心会一直冒险（这正是之前"表情卡住不恢复"的同一类原因）。
+    state.heartBurstTail = 8;
+    return;
+  }
+  if (state.heartBurstUntil) state.heartBurstUntil = 0;
+  if (state.heartBurstTail > 0) {
+    state.heartBurstTail -= 1;
+    setParam(core, "love", 0);
+    setParam(core, "ParamCheek73", 0);
+  }
+}
+
+/* ---------------------------------------------------------------- 压扁弹跳
+
+   移植自鲸鱼娘插件的 qBounce()：点一下会有一下"弹性下压"。
+
+   那边用的是 CSS `el.animate([{transform: scale(...)}...])`。在桌宠这种
+   **透明分层窗口**上，transform 会在动画期间反复触发 DWM 整窗重合成 ——
+   这正是之前查了很久的卡顿来源。这里改成直接改 PIXI 模型的 scale：
+   模型本来就每帧重建，改 scale 不产生新图层，开销只有每帧两次属性写入。
+*/
+/* ---------------------------------------------------------------- 压扁弹跳
+
+   参数与鲸鱼娘插件的 qBounce() **完全一致**：
+
+     keyframes: scale(1,1) → (1+0.1k, 1-0.12k) → (1-0.045k, 1+0.055k) → (1,1)
+     duration : 460ms
+     easing   : cubic-bezier(.34, 1.56, .64, 1)
+     origin   : 50% 100%（底边中点固定，往下压）
+
+   唯一的区别是**实现手法**：插件用 CSS `el.animate([{transform:...}])`，而桌宠是
+   透明分层窗口，transform 动画期间会反复触发 DWM 整窗重合成（卡顿元凶之一）。
+   这里按同样的关键帧 + 同样的贝塞尔曲线算出 sx/sy，落到 PIXI 模型的 scale 上，
+   并且通过调整 y 复现"底边固定"的 origin，观感一致但没有那笔重合成开销。
+*/
+
+const BOUNCE_MS = 460;
+const BOUNCE_BEZIER = { x1: 0.34, y1: 1.56, x2: 0.64, y2: 1 };
+
+// 关键帧（t 为整体进度 0..1，值是 k=1 时的缩放；实际按 k 缩放增量）
+const BOUNCE_KEYS = [
+  { at: 0, sx: 1, sy: 1 },
+  { at: 1 / 3, sx: 1.1, sy: 0.88 },
+  { at: 2 / 3, sx: 0.955, sy: 1.055 },
+  { at: 1, sx: 1, sy: 1 },
+];
+
+/** 解 cubic-bezier(x1,y1,x2,y2)，输入时间 x，返回缓动后的进度 y。 */
+function bezierY(x, b) {
+  const x1 = b.x1, y1 = b.y1, x2 = b.x2, y2 = b.y2;
+  const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+  const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+  let u = x;
+  for (let i = 0; i < 6; i += 1) {
+    const px = ((ax * u + bx) * u + cx) * u;
+    const d = (3 * ax * u + 2 * bx) * u + cx;
+    if (Math.abs(d) < 1e-6) break;
+    u -= (px - x) / d;
+    u = Math.min(1, Math.max(0, u));
+  }
+  return ((ay * u + by) * u + cy) * u;
+}
+
+/** 给定整体进度 t 和力度 k，算这一帧的 (sx, sy)。 */
+function bounceScaleAt(t, k) {
+  const e = bezierY(t, BOUNCE_BEZIER);   // 整体缓动（和 WAAPI 的 timing function 一致）
+  const p = Math.min(1, Math.max(0, e));
+  for (let i = 1; i < BOUNCE_KEYS.length; i += 1) {
+    const a = BOUNCE_KEYS[i - 1];
+    const b = BOUNCE_KEYS[i];
+    if (p <= b.at) {
+      const span = b.at - a.at;
+      const local = span > 0 ? (p - a.at) / span : 1;
+      const sx = a.sx + (b.sx - a.sx) * local;
+      const sy = a.sy + (b.sy - a.sy) * local;
+      // 关键帧是"k=1 时"的值，这里把增量按 k 缩放。
+      // **横向不参与**：插件那套是 scale(x, y) 双向反向挤压，看起来像横向抖动；
+      // 用户要的是纯纵向弹跳，所以 sx 恒为 1，只有 sy 变化。
+      return [1, 1 + (sy - 1) * k];
+    }
+  }
+  return [1, 1];
+}
+
+function bounceModel(power) {
+  const base = state.modelScale || 0;
+  if (!model || !base) return;
+  const baseH = (model.internalModel ? model.internalModel.height : 0) * base;
+  // 记下"底边"：origin 50% 100% 等于底边不动，缩放时靠调 y 复现。
+  // **上一次弹跳还没结束时不能重新取锚点** —— 那时 model.y 正处在被压扁的中间态，
+  // 拿它当底边会让模型一次比一次往下漂（连点几下就明显跑位）。
+  if (!state.bounceAt) state.bounceBottom = model.y + baseH;
+  state.bounceAt = performance.now();
+  state.bouncePower = power == null ? 1 : power;
+}
+
+function bounceTick(now) {
+  if (!state.bounceAt) return;
+  const base = state.modelScale || 0;
+  if (!model || !base) {
+    state.bounceAt = 0;
+    return;
+  }
+  const baseH = (model.internalModel ? model.internalModel.height : 0) * base;
+  const t = (now - state.bounceAt) / BOUNCE_MS;
+  if (t >= 1) {
+    model.scale.set(base);
+    if (state.bounceBottom) model.y = state.bounceBottom - baseH;
+    state.bounceAt = 0;
+    return;
+  }
+  const [sx, sy] = bounceScaleAt(t, state.bouncePower || 1);
+  model.scale.set(base * sx, base * sy);
+  if (state.bounceBottom) model.y = state.bounceBottom - baseH * sy;   // 底边固定
+}
+
 function applyGazeParameters(g) {
   const core = model && model.internalModel && model.internalModel.coreModel;
   if (!core) {
@@ -956,6 +1241,12 @@ function applyGazeParameters(g) {
   setParam(core, "ParamAngleY", -g.headY * GAZE_SCALE_HEAD);
   setParam(core, "ParamAngleZ", g.headX * GAZE_SCALE_HEAD * 0.25);
   setParam(core, "ParamBodyAngleX", g.bodyX * GAZE_SCALE_HEAD * 0.3);
+  heartBurstTick(core, performance.now());
+  bounceTick(performance.now());
+  // 到期复原**每帧**检查一次：原来挂在 2.5 秒的定时器上，表情到期后最长还要再等
+  // 2.5 秒才清掉，观感上就是"改了表情很久不恢复"。这个函数内部先判空/判未到期，
+  // 绝大多数帧是零开销。
+  tempExprTick();
   window.__gazeDebug = { error: null, phase: g.phase, written: g.x, readBack: readParam(core, "ParamEyeBallX") };
 }
 
@@ -1017,22 +1308,36 @@ function applyState(payload) {
   ui.cardActivityText.textContent = payload.activity || "等待 " + (payload.source || "Agent") + " 开始工作…";
   ui.cardSay.textContent = payload.say || "";
   ui.cardUsage.textContent = payload.usage || "";   // 今日新增 / 本会话累积（设置里可切、可关）
+  // API 余额（宿主每 60 秒从 DSH 的 /dsh-pet/hud 取一次，随状态下发）
+  if (ui.cardBalance) {
+    ui.cardBalance.textContent = payload.balance ? `余额 ${payload.balance}` : "";
+    ui.cardBalance.classList.toggle("hidden", !payload.balance);
+  }
 
   state.elapsed = payload.elapsed || 0;
 
   const expression = exprFor(payload.state);
-  state.tempExpr = null;
-  state.tempUntil = 0;
-  state.moodAt = Date.now();
-  if (expression) setExpression(expression);
-  else if (changed) {
-    state.expression = null;
-    try {
-      if (model && model.internalModel.motionManager.expressionManager) {
-        model.internalModel.motionManager.expressionManager.resetExpression();
+  // **只有状态真的变了**才清掉临时表情。
+  // 宿主每秒都会推一次状态（耗时/余额/用量在变），原来每次都清，于是戳出来的表情
+  // 活不过一秒就被状态表情顶回去 —— 用户看到的就是"有时候戳了表情不变"。
+  if (changed) {
+    state.tempExpr = null;
+    state.tempUntil = 0;
+    state.moodAt = Date.now();     // 顺带修掉：原来每秒都把 moodAt 刷新，
+                                   // 导致随机心情永远等不到间隔、实际几乎不触发
+  }
+  const tempActive = Boolean(state.tempExpr) && Date.now() < state.tempUntil;
+  if (!tempActive) {
+    if (expression) setExpression(expression);
+    else if (changed) {
+      state.expression = null;
+      try {
+        if (model && model.internalModel.motionManager.expressionManager) {
+          model.internalModel.motionManager.expressionManager.resetExpression();
+        }
+      } catch (err) {
+        /* older builds do not expose resetExpression */
       }
-    } catch (err) {
-      /* older builds do not expose resetExpression */
     }
   }
   if (changed && style.motion) playMotion(style.motion);
@@ -1060,7 +1365,29 @@ function humanTime(sec) {
 }
 
 function setCardOpen(open) {
-  state.cardOpen = Boolean(open);
+  const wasOpen = state.cardOpen;
+  const nextOpen = Boolean(open);
+  const turningOn = nextOpen && !wasOpen;
+  const turningOff = !nextOpen && wasOpen;
+  state.cardOpen = nextOpen;
+
+  // 打开卡片时把回复气泡收起来（两者同时出现必然盖住模型），
+  // 但**记下这条回复**：用户再按一次关掉卡片时，把它原样放回来。
+  if (turningOn && chat.shown) {
+    chat.suspended = {
+      text: chat.target,
+      name: ui.chatBubbleName ? ui.chatBubbleName.textContent : "",
+      foot: ui.chatBubbleFoot ? ui.chatBubbleFoot.textContent : "",
+    };
+    chatHide();
+  }
+  // 关掉卡片：如果之前是因为开卡片才收起的回复，这里放回来
+  if (turningOff && chat.suspended) {
+    const saved = chat.suspended;
+    chat.suspended = null;
+    chatShow(saved.text, { name: saved.name, foot: saved.foot, keepSuspended: true });
+    chatRenderFull();
+  }
   const tooSmall = window.innerHeight < 180 || window.innerWidth < 160;
   if (state.cardOpen && tooSmall) {
     state.cardOpen = false;
@@ -1071,6 +1398,9 @@ function setCardOpen(open) {
   ui.card.classList.toggle("hidden", !state.cardOpen);
   layout();          // 只重算模型缩放，不动窗口尺寸
   reportHitbox();
+  // 页面可能自己收起过卡片（例如来了回复），把状态回报给宿主，
+  // 否则宿主的 inline_card_open 会和实际不一致（"任务完成自动弹卡片"就失效了）。
+  bridge.send({ t: "card-state", open: state.cardOpen });
 }
 
 function updateCardDensity() {
@@ -1082,6 +1412,10 @@ function updateCardDensity() {
 if (window.ResizeObserver) {
   const observer = new ResizeObserver(() => layout());
   observer.observe(el("card"));
+  // 气泡同理：打字机把内容一点点长出来，高度变了要重新贴到模型上方，
+  // 否则它会按旧高度定位、越写越压住模型（实测 100% 缩放时重叠 48px）。
+  const bubbleNode = el("chat-bubble");
+  if (bubbleNode) observer.observe(bubbleNode);
 }
 
 function short(text, n) {
@@ -1089,7 +1423,31 @@ function short(text, n) {
 }
 
 let toastTimer = 0;
+/**
+ * 把反应文字摆到"模型底边"和"按钮顶边"之间的空隙里。
+ *
+ * 之前只在 layout() 里算，而 layout 有"输入没变就跳过"的守卫（还有提前 return），
+ * 结果经常压根没执行，toast 就一直停在 CSS 的默认位置上 —— 也就是按钮底下。
+ * 现在**每次显示时都重算**，并且在 layout 里也调一次（缩放/窗口变化要跟）。
+ */
+function positionToast() {
+  if (!ui.toast || !model) return;
+  const modelBottom = model.y + model.height;
+  let btnTop = 0;
+  if (ui.chatBtn) btnTop = ui.chatBtn.getBoundingClientRect().top;
+  // 按钮没显示（矩形全 0）时给个兜底
+  if (!(btnTop > 0)) btnTop = modelBottom + 8;
+  const toastH = ui.toast.getBoundingClientRect().height || 26;
+  // 挂在**按钮正上方**：底边离按钮 4px。这样允许压住模型下沿一点 ——
+  // 用户说没关系，而且比"把按钮往下推"更省纵向空间。
+  let top = Math.round(btnTop - toastH - 4);
+  top = Math.max(Math.round(model.y + 8), top);   // 别顶到模型头顶上去
+  ui.toast.style.top = `${top}px`;
+  ui.toast.style.bottom = "auto";
+}
+
 function toast(text) {
+  positionToast();
   ui.toast.textContent = text;
   ui.toast.classList.remove("hidden");
   clearTimeout(toastTimer);
@@ -1145,8 +1503,20 @@ function noticePosition() {
   const h = ui.notice.classList.contains("hidden") ? 0 : ui.notice.getBoundingClientRect().height;
   const bubbleOn = ui.chatBubble && ui.chatBubble.classList.contains("on");
   const bubbleH = bubbleOn ? ui.chatBubble.getBoundingClientRect().height : 0;
-  const top = Math.max(2, Math.round(model.y - bubbleH - h - 10));
-  ui.notice.style.top = `${top}px`;
+  // 任务卡片开着时，提示卡要**排在任务卡片下面**，两张卡片不能互相压：
+  // 提示卡（登录状态 / DSH 断联）是必须看清的内容，被任务卡片盖住会让人漏掉。
+  const cardOn = Boolean(
+    ui.card && !ui.card.classList.contains("hidden") && state.cardOpen !== false
+  );
+  let top;
+  if (cardOn) {
+    const cardH = ui.card.getBoundingClientRect().height;
+    top = Math.round(4 + cardH + 8);
+  } else {
+    top = Math.round(model.y - bubbleH - h - 10);
+  }
+  const maxTop = Math.max(2, window.innerHeight - h - 4);
+  ui.notice.style.top = `${Math.max(2, Math.min(top, maxTop))}px`;
 }
 
 
@@ -1166,6 +1536,10 @@ const approval = {
   id: "",          // 当前申请的 id（换了才重绘）
   key: "",         // 去重键：id + 内容摘要
   dismissedId: "", // 用户点 ✕ 收起的申请 id：同一个申请不再自动弹回来
+  // 权限卡片弹出时把任务卡片临时收起（两者都会占用模型上方那条带子，必然重叠），
+  // 处理完（通过 / 驳回 / ✕）再把它恢复回来。
+  cardWasOpen: false,
+  chatWasShown: false,
 };
 
 /** 显示（或更新）权限申请。内容没变就只保证可见，不碰 DOM。 */
@@ -1177,6 +1551,14 @@ function approvalShow(pending) {
   const key = `${pending.id || ""}|${pending.tool || ""}|${pending.detail || ""}|${pending.reason || ""}`;
   const first = !approval.open;
   const changed = approval.key !== key;
+
+  // 权限卡片优先级最高：先把它会重叠的东西收起来（记下来，处理完再恢复）
+  if (first) {
+    approval.cardWasOpen = Boolean(state.cardOpen);
+    approval.chatWasShown = Boolean(chat.shown);
+    if (state.cardOpen) setCardOpen(false);
+    if (chat.shown) chatHide();
+  }
 
   approval.open = true;
   approval.id = String(pending.id || "");
@@ -1226,6 +1608,21 @@ function approvalHide() {
         layout();
       }
     }, 170);
+    // 权限处理完了（通过 / 驳回 / ✕）：把刚才让位的东西恢复回来。
+    // 任务卡片优先（它是用户主动在看的），否则恢复被收起的回复气泡。
+    if (approval.cardWasOpen) {
+      approval.cardWasOpen = false;
+      approval.chatWasShown = false;
+      setCardOpen(true);
+    } else if (approval.chatWasShown) {
+      approval.chatWasShown = false;
+      if (chat.suspended) {
+        const saved = chat.suspended;
+        chat.suspended = null;
+        chatShow(saved.text, { name: saved.name, foot: saved.foot, keepSuspended: true });
+        chatRenderFull();
+      }
+    }
   }
 }
 
@@ -1253,8 +1650,15 @@ function approvalPosition() {
   const bubbleH = bubbleOn ? ui.chatBubble.getBoundingClientRect().height : 0;
   const noticeOn = ui.notice && !ui.notice.classList.contains("hidden");
   const noticeH = noticeOn ? ui.notice.getBoundingClientRect().height : 0;
-  const top = Math.max(2, Math.round(model.y - bubbleH - noticeH - h - 12));
-  ui.approval.style.top = `${top}px`;
+  // 避开任务卡片：权限卡是最需要看清的内容，被任务卡片压住会漏掉
+  const cardOn = Boolean(
+    ui.card && !ui.card.classList.contains("hidden") && state.cardOpen !== false
+  );
+  const cardH = cardOn ? ui.card.getBoundingClientRect().height + 8 : 0;
+  const top = cardOn
+    ? Math.round(4 + cardH + (noticeOn ? noticeH + 8 : 0))
+    : Math.round(model.y - bubbleH - noticeH - h - 12);
+  ui.approval.style.top = `${Math.max(2, top)}px`;
 
   // 水平居中：直接算 left，不用 transform（transform 会创建合成层，
   // 让透明分层窗口整体重新合成 —— 见上面 CSS 里的说明）。
@@ -1281,6 +1685,11 @@ const chat = {
   ticker: null,
   userScrolled: false,   // 用户手动滚过：别再被"自动贴底"拉回去
   pin: null,             // 本次要把内容滚到哪："top"（新回复，从开头看）/ "bottom"（流式追尾）
+  // 因为"打开进度卡片"而被收起来的那条回复：卡片关掉时原样放回来。
+  // { text, name, foot }，没有就是 null。
+  suspended: null,
+  heartBurstUntil: 0,   // 摸头爱心爆发的截止时刻（performance.now 口径）
+  heartBurstTail: 0,    // 结束后还要写几帧 0，确保爱心真的收干净
   CHARS_PER_TICK: 2,
 };
 
@@ -1633,6 +2042,15 @@ function chatPosition() {
 function chatShow(text, opts) {
   const o = opts || {};
   if (!ui.chatBubble) return;
+  // 卡片和气泡互斥：纵向只有一条带子（模型上方 ~174px），两者同时出现必然重叠、
+  // 盖住模型。回复比"进度快照"更重要，所以显示回复时先收起卡片。
+  if (state.cardOpen) {
+    // 有新回复要显示：之前暂存的旧回复就不用再恢复了，清掉以免它盖住这条新的
+    chat.suspended = null;
+    setCardOpen(false);
+  }
+  // 恢复调用（卡片关掉时）要保留暂存以外的语义；正常显示新回复则清掉暂存
+  if (!o.keepSuspended) chat.suspended = null;
   chatEnsureTicker();
   if (o.name && ui.chatBubbleName) ui.chatBubbleName.textContent = o.name;
   chat.target = String(text == null ? "" : text);
@@ -1658,6 +2076,23 @@ function chatShow(text, opts) {
   chat.shown = true;
   layout();
   chatRefreshScrollButtons();
+}
+
+/**
+ * 立刻把整段文本渲染出来（不给打字机逐字长）。
+ *
+ * 用于"卡片关掉后把之前收起的回复放回来"：这条回复用户已经看过，
+ * 再逐字打一遍既慢又奇怪。
+ */
+function chatRenderFull() {
+  if (!ui.chatBubbleBody) return;
+  chat.typed = chat.target.length;
+  chat.pin = "top";
+  ui.chatBubbleBody.innerHTML = renderRichText(chat.target);
+  fitMathInBubble(ui.chatBubbleBody);
+  chatApplyPin(ui.chatBubbleBody);
+  chatRefreshScrollButtons();
+  layout();
 }
 
 function chatHide() {
@@ -1693,6 +2128,8 @@ function petBtnNode(which) {
     "approval-allow": ui.approvalAllow,
     "approval-deny": ui.approvalDeny,
     "approval-close": ui.approvalClose,
+    "card-close": ui.cardClose,
+    "card-key": ui.cardBtn,
     "scroll-up": ui.chatScrollUp,
     "scroll-down": ui.chatScrollDown,
   };
@@ -1904,25 +2341,217 @@ function reportProbe(over, alpha) {
   bridge.send({ t: "over", value, x: pt ? pt.x : null, y: pt ? pt.y : null, alpha: alpha });
 }
 
+
+/* ---------------------------------------------------------------- 戳戳互动
+
+   移植自 DSH 网页版鲸鱼娘插件的 poke()：核心不是"点一下换个表情"，而是
+     · **连击分档**：看滑动窗口里的点击速率，慢点只是可爱反应，手快才会撒娇抗议，
+       手速党才会真炸毛（而且炸毛后有冷静期，不会一直凶人）
+     · **加权表情池 + 专属台词**，连续点不重复
+     · **干活时**走"人家在忙"的池子，只给一次性反应，不动工作状态
+     · 部分表情附带爱心爆发（复用 heartBurst）
+
+   卡顿考量：这里没有任何每帧逻辑，也没有新的 CSS 合成层（不用 transform/滤镜），
+   点击时只是一次临时表情 + 一次 toast 文案，开销和原来的"换个表情"同一量级。
+*/
+
+// 连击分档阈值（毫秒）。数值直接沿用鲸鱼娘插件，手感是调过的。
+const POKE_TIER = {
+  window: 2600,     // 统计窗口
+  softCount: 4,     // 窗口内至少 4 下
+  softGap: 420,     // 且平均间隔 ≤ 420ms（≈2.4 下/秒）→ 撒娇抗议
+  hardCount: 7,     // 窗口内至少 7 下
+  hardGap: 260,     // 且平均间隔 ≤ 260ms（≈3.8 下/秒）→ 真炸毛
+  softCool: 1500,   // 撒娇之间的最小间隔
+  angerCool: 6000,  // 炸毛后的冷静期
+};
+
+// 干活时被戳：带一点"人家在忙啦"
+const POKE_BUSY = [
+  { face: "调皮", w: 1.4, lines: ["别闹啦，人家在忙", "等一下下嘛", "（嘴上嫌弃，手上没停）", "手拿开啦，正忙着呢"] },
+  { face: "生气", w: 0.4, lines: ["主人！人家正在忙", "再戳就做不完了哦", "（气鼓鼓地继续干活）"] },
+  { face: "脸红", w: 1.2, lines: ["唔…等我弄完再说", "（被戳得晃了一下，又低头看本子）"] },
+  { face: "开心兴奋", w: 1.2, lines: ["知道啦知道啦", "（抬头笑一下，又埋头干活）", "在在在，人家听着呢"] },
+  { face: "吐舌", w: 1.0, lines: ["忙着呢，不理你", "略，等会儿再说"] },
+  { face: "星星眼", w: 0.6, lines: ["！（笔掉了）", "吓人家一跳！"] },
+];
+
+// 摸头（宿主判定为头部区域）
+const POKE_HEAD = [
+  { face: "脸红", w: 1.6, fx: "heart", lines: ["不要突然摸头啦……再摸一下也不是不行。", "唔…头发要乱了啦", "（脸红）就、就一下哦", "哼，才没有很享受", "（尾巴尖偷偷晃了一下）"] },
+  { face: "开心兴奋", w: 1.4, lines: ["嘿嘿～主人", "嗯？叫人家吗", "在的在的", "摸摸头也不错嘛", "（眯着眼睛蹭了一下）"] },
+  { face: "爱心眼", w: 1.0, fx: "heart", lines: ["最喜欢主人了", "（冒爱心）", "（踮脚）还要！", "今天也最喜欢主人"] },
+  { face: "调皮", w: 1.0, lines: ["哼，就这一次哦", "才、才没有很开心", "别以为人家好哄", "（嘴上嫌弃，头却没躲）"] },
+  { face: "星星眼", w: 0.8, lines: ["（眼睛亮了一下）", "再摸一下？", "今天心情不错嘛"] },
+];
+
+// 戳身体
+const POKE_BODY = [
+  { face: "调皮", w: 1.3, lines: ["别戳啦", "痒！", "（躲了一下）", "手拿开啦", "戳我干嘛呀"] },
+  { face: "吐舌", w: 1.1, lines: ["略略略", "就不理你", "（吐舌头）", "戳一下换一碗白饭，成交吗"] },
+  { face: "脸红", w: 1.0, fx: "heart", lines: ["别、别戳那里啦", "唔…", "（往后缩了缩）"] },
+  { face: "开心兴奋", w: 1.0, lines: ["嗯？什么什么", "主人在叫人家吗", "（凑过来）"] },
+  { face: "生气", w: 0.35, lines: ["再戳就生气了", "（气鼓鼓）", "说了别戳啦"] },
+];
+
+// 摸头用的台词（从上面 POKE_HEAD 拍平；表情不再用，只要台词）
+const HEAD_LINES = POKE_HEAD.reduce((acc, it) => acc.concat(it.lines || []), []);
+
+// 手快被戳痒 / 真炸毛
+// 手快被戳痒：每个条目自带表情和对应台词（之前是"随机表情 + 通用台词"，
+// 于是会出现"脸红配一句生气的话"这种文不对脸的情况；鲸鱼娘插件是成对的）。
+const POKE_TICKLISH = [
+  { face: "调皮", w: 1.3, lines: ["好痒！别戳这么快啦", "（缩成一团）", "别戳啦别戳啦"] },
+  { face: "脸红", w: 1.1, lines: ["慢、慢一点啦", "（边躲边笑）", "唔…太痒了"] },
+  { face: "吐舌", w: 0.9, lines: ["哈哈哈不要", "戳这么快想干嘛", "（笑得停不下来）"] },
+];
+
+// 真炸毛：同样是成对的（生气多半，偶尔被戳晕）
+const POKE_MANY = [
+  { face: "生气", w: 1.8, lines: ["再戳人家真的要生气了！", "哼！不理你了", "主人你够了哦", "（炸毛）"] },
+  // 不用「晕晕」：那张"被砸晕"的脸之前被明确要求从所有池子里移除
+  { face: "流汗", w: 0.5, lines: ["（被戳得有点晕）", "别、别戳了啦"] },
+];
+
+const pokeState = { times: [], softAt: 0, angerAt: 0, lastPick: {} };
+
+function pokePrune(now) {
+  const t = pokeState.times;
+  while (t.length && now - t[0] > POKE_TIER.window) t.shift();
+}
+
+function pokeRecord(now) {
+  const t = pokeState.times;
+  t.push(now);
+  if (t.length > 60) t.splice(0, t.length - 60);
+  pokePrune(now);
+}
+
+/** 现在的手速处在哪一档。只读，不改记录。 */
+function pokeTier(now) {
+  pokePrune(now);
+  const t = pokeState.times;
+  const count = t.length;
+  const gap = count >= 2 ? (t[count - 1] - t[0]) / (count - 1) : Infinity;
+  const T = POKE_TIER;
+  const rapid = count >= T.softCount && gap <= T.softGap;
+  const furious =
+    rapid && count >= T.hardCount && gap <= T.hardGap && now - pokeState.angerAt > T.angerCool;
+  return { count, gap, rapid, furious };
+}
+
+/** 按权重抽一个（同时跳过被设置关掉的表情）。 */
+function pickWeighted(list) {
+  let source = (list || []).filter((it) => it && expressionAllowed(it.face));
+  if (!source.length) return null;
+  // 别抽到"当前正显示的那张脸"：同一个表情再设一次，画面上等于没变化
+  // （台词会换，但用户先看到的是脸）。
+  // 两个都要避开：
+  //   · state.expression —— 当前实际在演的那张脸（可能是状态底表情，比如
+  //     working 的"开心兴奋"，而戳的池子里也有它）；
+  //   · state.tempExpr   —— 正在演的临时表情。
+  if (source.length > 1) {
+    const busyFaces = [state.expression, state.tempExpr].filter(Boolean);
+    if (busyFaces.length) {
+      const others = source.filter((it) => !busyFaces.includes(it.face));
+      if (others.length) source = others;
+    }
+  }
+  let total = 0;
+  for (const it of source) total += it.w || 1;
+  let r = Math.random() * total;
+  for (const it of source) {
+    r -= it.w || 1;
+    if (r <= 0) return it;
+  }
+  return source[source.length - 1];
+}
+
+/** 从台词里抽一句，尽量不和上一句重复。 */
+function pickFreshFrom(lines, key) {
+  const list = lines || [];
+  if (!list.length) return "";
+  if (list.length === 1) return list[0];
+  let pick = list[Math.floor(Math.random() * list.length)];
+  if (pick === pokeState.lastPick[key]) {
+    const i = list.indexOf(pick);
+    pick = list[(i + 1 + Math.floor(Math.random() * (list.length - 1))) % list.length];
+  }
+  pokeState.lastPick[key] = pick;
+  return pick;
+}
+
+/** 执行一次互动：一个表情 + 一句台词 +（至多）一个爱心爆发。 */
+function pokeAct(hit, ms, withMotion) {
+  if (!hit) return;
+  setTempExpression(hit.face, ms / 1000);
+  if (hit.fx === "heart") heartBurst(ms);
+  if (hit.lines && hit.lines.length) {
+    // key 用表情名 + 首句：不同条目可能共用同一个表情（比如"调皮"在身体池和
+    // 撒娇池里都有），只看表情名会让它们互相污染"上一句"的记录。
+    toast(pickFreshFrom(hit.lines, "line-" + hit.face + "-" + hit.lines[0]));
+  }
+  // 连点时不放动作：多个动作叠着播最容易掉帧，而且视觉上也乱
+  if (withMotion) playMotion(Math.random() < 0.5 ? "Tap" : "Show");
+}
+
+/** 单击身体：完整移植鲸鱼娘的分档逻辑。 */
+function pokeReact() {
+  const now = performance.now();
+  const key = state.key || "idle";
+  const busy = key !== "idle" && key !== "done";
+
+  // 干活时被戳：只给一次性反应，不动工作状态
+  if (busy) {
+    pokeAct(pickWeighted(POKE_BUSY), 1200, true);
+    return;
+  }
+
+  pokeRecord(now);
+  const tier = pokeTier(now);
+
+  // 真炸毛：只有手速党见得到，且有冷静期
+  if (tier.furious) {
+    pokeState.angerAt = now;
+    pokeAct(pickWeighted(POKE_MANY), 1400, true);
+    return;
+  }
+
+  // 手快但没到炸毛：撒娇抗议（有最小间隔，免得连点变刷屏）
+  if (tier.rapid && now - pokeState.softAt > POKE_TIER.softCool) {
+    pokeState.softAt = now;
+    pokeAct(pickWeighted(POKE_TICKLISH), 1300, true);
+    return;
+  }
+
+  // 12% 概率喷水：沿用鲸鱼娘"把 splash 绑在左键点她上"的设计
+  if (Math.random() < 0.12 && playMotion("Splash")) {
+    bounceModel(1.25);
+    toast(pickFreshFrom(["（喷水）噗——", "鲸鱼是会喷水的！", "（喷你一脸）嘻嘻"], "splash"));
+    return;
+  }
+
+  // 普通一次戳：加权池 + 专属台词（连点不重复），不放动作以免叠播
+  bounceModel(1);
+  pokeAct(pickWeighted(POKE_BODY), 1200, false);
+}
+
 function reaction(kind) {
   if (kind === "pat") {
-    setTempExpression(pickAllowed(PAT_MOODS), 3.0);
-    playMotion("Tap");
-    toast("摸摸头～");
+    // 摸头：只做爱心爆发 + 一句台词 + 弹一下，**不再改表情**（用户要求删除）
+    heartBurst(1500);
+    bounceModel(0.85);
+    toast(pickFreshFrom(HEAD_LINES, "head"));
   } else if (kind === "poke") {
-    setTempExpression(pickAllowed(POKE_MOODS), 2.6);
-    playMotion(Math.random() < 0.5 ? "Tap" : "Show");
+    // 单击戳戳：连击分档 + 加权池（见 pokeReact）
+    pokeReact();
   } else if (kind === "drag") {
-    state.dragged = true;
-    setTempExpression(pickAllowed(DRAG_MOODS), 8);
-    playMotion("Tap");
+    // 拖拽：只记录状态，**不再改表情**（用户要求删除）
   } else if (kind === "drop") {
-    state.dragged = false;
-    setTempExpression(pickAllowed(DROP_MOODS), 3.4);
-    playMotion(Math.random() < 0.5 ? "Show" : "Tap");
+    bounceModel(0.7);            // 放下时弹一下就够了
   } else if (kind === "motion") {
     playMotion(Math.random() < 0.5 ? "Tap" : "Show");
-    setTempExpression(pickAllowed(MOOD_POOLS[state.key] || MOOD_POOLS.idle), 4);
+    setTempExpression(pickAllowed(MOOD_POOLS[state.key] || MOOD_POOLS.idle), 1.4);
   }
 }
 
@@ -2098,6 +2727,20 @@ window.__pet = {
     state: state.key,
     label: STATE_STYLE[state.key] ? STATE_STYLE[state.key].label : state.key,
     expression: state.expression,
+    tempExpr: state.tempExpr || null,
+    tempLeftMs: state.tempUntil ? Math.max(0, Math.round(state.tempUntil - Date.now())) : 0,
+    burstLeftMs: state.heartBurstUntil ? Math.max(0, Math.round(state.heartBurstUntil - performance.now())) : 0,
+    burstTail: state.heartBurstTail || 0,
+    params: (() => {
+      try {
+        const c = model && model.internalModel && model.internalModel.coreModel;
+        if (!c) return null;
+        const read = (id) => {
+          try { return Math.round(c.getParameterValueById(id) * 1000) / 1000; } catch (e) { return null; }
+        };
+        return { love: read("love"), cheek73: read("ParamCheek73") };
+      } catch (e) { return null; }
+    })(),
     lastMotion: state.lastMotion || null,
     autoMotion: !state.settings || state.settings.autoMotion !== false,
     autoExpression: !state.settings || state.settings.autoExpression !== false,

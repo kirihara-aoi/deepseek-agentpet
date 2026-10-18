@@ -36,8 +36,9 @@ canvas {
    圆角外面用 clip-path 强制切掉，杜绝直角残留。 */
 .card {
   position: absolute;
-  left: 12px;
-  right: 12px;
+  /* 横向收窄：左右各内缩 36px，卡片再窄 12px，给模型留更多横向空间 */
+  left: 36px;
+  right: 36px;
   top: 10px;              /* 实际位置由 JS 贴着"角色头顶"算出来 */
   height: auto;              /* 高度由内容撑开（标题、数据行、最近一句话） */
   z-index: 3;
@@ -70,9 +71,43 @@ canvas {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
+/* 卡片右上角的关闭键。只用颜色变化做反馈 —— 桌宠是色键透明的分层窗口，
+   按钮上加 transform 会让 DWM 重新合成整个窗口，鼠标划过就卡。 */
+.card-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  z-index: 2;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.06);
+  color: #f2eef4;
+  font-size: 11px;
+  line-height: 1;
+  cursor: default;          /* 点击由宿主鼠标钩子命中，不是网页光标 */
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.card-close.hot {
+  background: rgba(255, 138, 138, 0.85);
+  border-color: rgba(255, 200, 200, 1);
+  color: #ffffff;
+}
+
+.card-close.press {
+  background: rgba(255, 110, 110, 1);
+  border-color: rgba(255, 220, 220, 1);
+  color: #ffffff;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+
 .card-body {
   position: relative;
-  padding: calc(var(--card-scale) * 16px) calc(var(--card-scale) * 18px) calc(var(--card-scale) * 14px);
+  /* 右侧多留一点：右上角有 ✕ 关闭键，别让状态文字压到它下面 */
+  padding: calc(var(--card-scale) * 16px) calc(var(--card-scale) * 30px) calc(var(--card-scale) * 14px) calc(var(--card-scale) * 18px);
 }
 
 .card-head {
@@ -92,6 +127,17 @@ canvas {
 .card-state {
   font-weight: 600;
   font-size: calc(var(--card-scale) * 13.5px);
+}
+
+/* 卡片右上角的 API 余额：靠右、小号、等宽数字，别抢状态文字的注意力。
+   margin-right 给右上角的 ✕ 留位置。 */
+.card-balance {
+  margin-left: auto;
+  margin-right: calc(var(--card-scale) * 26px);
+  font-size: calc(var(--card-scale) * 11.5px);
+  font-variant-numeric: tabular-nums;
+  color: #9fd8b4;
+  white-space: nowrap;
 }
 
 .card-title {
@@ -760,14 +806,16 @@ canvas {
 .toast {
   position: absolute;
   left: 50%;
-  bottom: 42px;
+  /* top 由 layout() 算到"模型底部与按钮之间"那把空隙里；这里不留 bottom，
+     否则两条定位会打架（bottom 优先，会把它拽回最底下） */
+  top: 78%;
   transform: translateX(-50%);
-  padding: 6px 12px;
+  padding: 4px 11px;
   border-radius: 999px;
   background: #1b1e26;
   border: 1px solid rgba(255, 255, 255, 0.12);
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
-  font-size: 12px;
+  font-size: 11.5px;
   white-space: nowrap;
 }
 
@@ -1052,3 +1100,56 @@ canvas {
   background: rgba(206, 92, 100, 1);
 }
 
+/* ---------------------------------------------------------------- 窄窗口适配
+
+   桌宠缩到很小时（窗口宽度只有两三百 CSS 像素），卡片原来按固定字号排，
+   一条普通的提示就会把整个窗口填满、还盖住底部按钮。这里按视口宽度/高度
+   自动收紧：字号变小、正文限高、卡片贴近窗口边缘。
+   （用媒体查询而不是 JS：纯样式，改动零成本，也不会参与任何布局循环。）
+*/
+
+/* 卡片永远不许超出窗口 */
+.notice,
+.approval,
+.chat-bubble,
+.card {
+  max-width: calc(100% - 8px);
+  box-sizing: border-box;
+}
+
+/* 窄 → 整体收紧 */
+@media (max-width: 320px) {
+  .notice {
+    width: calc(100% - 10px);
+    padding: 6px 8px 7px;
+    font-size: 10.5px;
+    line-height: 1.45;
+  }
+  .notice-title { font-size: 10.5px; }
+  .notice-body { max-height: 54px; overflow: hidden; }
+  .notice-close { width: 15px; height: 15px; font-size: 9.5px; }
+
+  .chat-bubble {
+    max-width: calc(100% - 10px);
+    min-width: 0;
+    padding: 7px 9px 6px;
+    font-size: 11px;
+  }
+  .chat-bubble-body { max-height: 84px; }
+
+  .approval {
+    width: calc(100% - 10px);
+    padding: 7px 9px 8px;
+  }
+  .approval-detail { max-height: 52px; }
+  .approval-btn { padding: 4px 10px; font-size: 10.5px; }
+
+  .card { left: 16px; right: 16px; }
+}
+
+/* 矮 → 正文再收一点，保证底部按钮那一排还露得出来 */
+@media (max-height: 420px) {
+  .notice-body { max-height: 46px; overflow: hidden; }
+  .chat-bubble-body { max-height: 70px; }
+  .approval-detail { max-height: 44px; }
+}

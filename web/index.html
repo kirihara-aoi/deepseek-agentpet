@@ -13,10 +13,12 @@
     <!-- 进度卡片：画在桌宠自己的网页里，宽度固定、高度由内容撑开，不改窗口尺寸 -->
     <div id="card" class="card style-glass hidden">
       <div class="card-bg"></div>
+      <button class="card-close" id="card-close" type="button" title="收起进度卡片">✕</button>
       <div class="card-body">
         <div class="card-head">
           <span class="card-dot" id="card-dot"></span>
           <span class="card-state" id="card-state">空闲</span>
+          <span class="card-balance hidden" id="card-balance"></span>
         </div>
         <div class="card-title" id="card-title">当前没有进行中的任务</div>
         <div class="card-row">
@@ -74,6 +76,7 @@
     <!-- 和「说话」按钮并排的两个快捷键按钮（点击同样由宿主钩子命中） -->
     <div id="dsh-btn" class="pet-key-btn hidden" title="切到 DeepSeek Harness 网页版">DSH</div>
     <div id="deepseek-btn" class="pet-key-btn hidden" title="切到 chat.deepseek.com（专用 Edge）">DS</div>
+    <div id="card-btn" class="pet-key-btn" title="打开 / 收起任务进度卡片">进度</div>
 
     <div id="toast" class="toast hidden"></div>
 
