@@ -5212,21 +5212,22 @@ class PetHost:
                 self.invoke_on_pet(lambda: self._after(1.2, self._focus_dsh_browser, 4, 1.0))
                 return
 
-            # 直接跑命令启动 DSH 网页版，不依赖任何快捷方式。
-            # os.startfile(.lnk) 对指向 .cmd 的快捷方式会卡十来秒再抛
-            # OSError(22, '操作已被用户取消')（实测），所以改 subprocess。
-            npx = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "nodejs", "npx.cmd")
-            if not os.path.isfile(npx):
-                npx = "npx.cmd"     # 退回 PATH 查找
+            # 通过桌面上的 dsh 快捷方式（默认 deepseek_harness.lnk）启动 DSH。
+            # os.startfile 让它脱离桌宠独立运行，不残留子进程。
+            shortcut = self.dsh_shortcut_path()
+            if not shortcut:
+                log("没找到 dsh 快捷方式（设置里的 dshShortcut=%r），直接开网页版"
+                    % (self.settings or {}).get("dshShortcut"))
+                self.open_dsh_page(port)
+                self.invoke_on_pet(lambda: self._after(1.2, self._focus_dsh_browser, 4, 1.0))
+                return
             try:
-                subprocess.Popen(
-                    '"%s" --verbose @deepseek-ai/dsh web' % npx,
-                    shell=True,
-                    creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
-                )
-                log("DeepSeek Harness 没在跑，已启动：%s web" % npx)
+                # 开机后第一次启动可能比较慢：先给个提示
+                self.post({"t": "say", "text": "正在启动 DeepSeek Harness…"})
+                os.startfile(shortcut)  # noqa: S606
+                log("DeepSeek Harness 没在跑，已启动：%s" % shortcut)
             except Exception as exc:  # noqa: BLE001
-                log("启动 dsh 网页版失败：%r（改成直接开网页版）" % (exc,))
+                log("启动 dsh 快捷方式失败：%r（改成直接开网页版）" % (exc,))
                 self.open_dsh_page(port)
                 self.invoke_on_pet(lambda: self._after(1.2, self._focus_dsh_browser, 4, 1.0))
                 return
@@ -5236,6 +5237,30 @@ class PetHost:
             log("打开 DeepSeek Harness 出错：%r" % (exc,))
         finally:
             self._dsh_opening = False      # 无论成功/失败/提前返回，都允许下次再点
+
+    def dsh_shortcut_path(self) -> str:
+        """找桌面上那个 dsh 快捷方式。
+
+        设置里只写文件名（默认 deepseek_harness.lnk）时，按"当前用户桌面 → 公共桌面"
+        依次找；写了完整路径就直接用。
+        """
+        raw = str((self.settings or {}).get("dshShortcut") or "deepseek_harness.lnk").strip()
+        if not raw:
+            raw = "deepseek_harness.lnk"
+        if os.path.isabs(raw):
+            return raw if os.path.isfile(raw) else ""
+        candidates = []
+        try:
+            candidates.append(os.path.join(os.path.expanduser("~"), "Desktop"))
+        except Exception:  # noqa: BLE001
+            pass
+        public = os.environ.get("PUBLIC") or r"C:\Users\Public"
+        candidates.append(os.path.join(public, "Desktop"))
+        for folder in candidates:
+            path = os.path.join(folder, raw)
+            if os.path.isfile(path):
+                return path
+        return ""
 
     def open_dsh_page(self, port: int | None = None) -> None:
         """用默认浏览器打开 dsh 网页版（服务起来之前打开会连不上，所以只在已就绪时用）。"""
@@ -5608,8 +5633,10 @@ class PetHost:
             log("DSH 服务没在跑，先启动它")
             self.open_dsh()
             return
-        hit = (self.find_dsh_web_window(port, kind="dsh", use_cache=False)
-               or self.find_dsh_web_window(port, kind="any", use_cache=False))
+        # DSH 按钮只认真正的 DSH 页（标题带 "DeepSeek Harness"）。
+        # 以前这里回退 kind="any"，会把 chat.deepseek.com 聊天页（标题带 "DeepSeek"）
+        # 也匹配上，于是按 DSH 按钮反而跳到 DS 专属 Edge（用户实测反馈）。
+        hit = self.find_dsh_web_window(port, kind="dsh", use_cache=False, include_minimized=True)
         if hit:
             self._activate_window(hit[1], maximize=True)
             self.set_dsh_watch_present(True)
@@ -5617,7 +5644,7 @@ class PetHost:
             log("已切到 DSH 网页版窗口：%s" % hit[2])
         else:
             log("没找到 DSH 页窗口，改用打开网页版")
-            self.open_dsh()
+            self.open_dsh_page(port)
 
     def drain_chat_button(self) -> None:
         """消费钩子里记下的「说话」按钮点击（在界面线程里执行，能安全开窗口）。"""
