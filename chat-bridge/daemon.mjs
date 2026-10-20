@@ -360,6 +360,17 @@ function parseCompletionSse(raw) {
   let finished = false;
   let messageId = null;
   let fragCount = 0;
+  // 协议里所有追加都打到"最后一个片段"（response/fragments/-1/content）。
+  // 思考阶段最后那个片段是 THINKING，正文阶段才变成 RESPONSE ——
+  // 所以必须记住"当前片段类型"，否则思考内容会被当成正文追加进去
+  //（用户反馈"气泡里全是深度思考"就是这个）。
+  let currentType = "RESPONSE";
+  // 实测 DeepSeek 接口里思考片段的 type 是 **"THINK"**（不是 "THINKING"），
+  // 另外见过 "THINKING"/"REASONING" 的写法，一并认。
+  const isThinkType = (t) => {
+    const u = String(t || "").toUpperCase();
+    return u === "THINK" || u === "THINKING" || u === "REASONING";
+  };
   for (const block of String(raw || "").split("\n\n")) {
     let event = "";
     const datas = [];
@@ -380,33 +391,84 @@ function parseCompletionSse(raw) {
         fragCount += list.length;
         for (const f of list) {
           if (!f || typeof f.content !== "string") continue;
-          if (f.type === "THINKING" || f.type === "thinking") thinking += f.content;
+          const ty = String(f.type || "RESPONSE").toUpperCase();
+          currentType = ty;
+          if (isThinkType(ty)) thinking += f.content;
           else frags.push(f.content);
         }
       }
       if (resp && typeof resp.content === "string") finalText = resp.content;
 
       // 格式 2：{"p":"response/fragments/-1/content","o":"APPEND","v":"..."}
-      if (typeof j.p === "string" && typeof j.v === "string") {
-        if (/response\/fragments.*content/.test(j.p)) frags.push(j.v);
-        else if (/response\/status/.test(j.p)) finished = j.v === "FINISHED";
-        else if (/thinking/.test(j.p)) thinking += j.v;
+      // 片段数组整体追加：{"p":"response/fragments","o":"APPEND","v":[{"type":"RESPONSE","content":"递归"}]}
+      // **正文片段就是靠这个进来的**，原代码只处理 v 是字符串的情况，于是整个正文被丢掉、
+      // currentType 也一直停在 THINK，后续逐字追加全被算成思考内容。
+      if (typeof j.p === "string" && Array.isArray(j.v)) {
+        if (/response\/fragments/.test(j.p)) {
+          for (const f of j.v) {
+            if (!f || typeof f.content !== "string") continue;
+            const ty = String(f.type || "RESPONSE").toUpperCase();
+            currentType = ty;
+            if (isThinkType(ty)) thinking += f.content;
+            else frags.push(f.content);
+          }
+        }
         continue;
       }
-      // 格式 3：裸 {"v":"..."}（就是正文追加）
+      // 批量补丁：{"p":"response","o":"BATCH","v":[{"p":"...","v":"..."}]}
+      if (j.o === "BATCH" && Array.isArray(j.v)) {
+        for (const inner of j.v) {
+          if (!inner || typeof inner.p !== "string") continue;
+          if (/think|reason/i.test(inner.p)) { thinking += String(inner.v == null ? "" : inner.v); continue; }
+          if (/response\/fragments.*content/.test(inner.p) && typeof inner.v === "string") {
+            if (isThinkType(currentType)) thinking += inner.v;
+            else frags.push(inner.v);
+          }
+        }
+        continue;
+      }
+      if (typeof j.p === "string" && typeof j.v === "string") {
+        if (/think|reason/i.test(j.p)) { thinking += j.v; continue; }
+        if (/response\/fragments.*content/.test(j.p)) {
+          // 追加到"最后一个片段"：按当前片段类型分流，别把思考内容混进正文
+          if (isThinkType(currentType)) thinking += j.v;
+          else frags.push(j.v);
+          continue;
+        }
+        if (/response\/status/.test(j.p)) { finished = j.v === "FINISHED"; continue; }
+        continue;
+      }
+      // 格式 3：裸 {"v":"..."}（追加到当前片段，同样按类型分流）
       if (typeof j.v === "string") {
-        frags.push(j.v);
+        if (isThinkType(currentType)) thinking += j.v;
+        else frags.push(j.v);
         continue;
       }
       // 别处见过的数组形式
       if (Array.isArray(j.fragments)) {
-        for (const f of j.fragments) if (f && typeof f.content === "string") frags.push(f.content);
+        for (const f of j.fragments) {
+          if (!f || typeof f.content !== "string") continue;
+          const ty = String(f.type || "RESPONSE").toUpperCase();
+          currentType = ty;
+          if (isThinkType(ty)) thinking += f.content;
+          else frags.push(f.content);
+        }
       }
     }
   }
-  // finalText（整段 content）优先；否则把各种追加拼起来
+  // finalText（整段 content）优先；否则把各种追加拼起来。
+  // 正文优先取"逐片拼接"的结果：响应级的 content 有时装的是**思考内容**
+  //（实测 resp.content 就是 THINK 那一段），直接用它会把正文弄丢。
+  const joined = frags.join("");
+  let text = joined;
+  if (!text && finalText) text = finalText;
+  // 若整段 content 把思考也拼在前面，剥掉它（剥完为空就退回逐片拼接）
+  if (thinking && text.startsWith(thinking)) {
+    const rest = text.slice(thinking.length);
+    text = rest.length ? rest : joined;
+  }
   return {
-    text: finalText && finalText.length > 0 ? finalText : frags.join(""),
+    text: text.trim(),
     thinking,
     closed,
     finished,
@@ -432,11 +494,31 @@ async function attach(cdp, target) {
 
 /** 页面侧的小工具集（注入一次，之后复用）。
  *  版本号很重要：页面会一直留着上一版注入的 __dshPetChat，改代码后必须靠它强制重装。 */
-const HELPER_VERSION = 3;
+const HELPER_VERSION = 5;
 const HELPERS = `(() => {
   if (window.__dshPetChat && window.__dshPetChatVersion === ${HELPER_VERSION}) return 'already';
   const q = (sel) => document.querySelector(sel);
   const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  // 去掉"深度思考"块，只留正式回复正文。
+  // 思考内容渲染在回复容器内部（collapsible），直接 innerText 会把推理过程一起带出来。
+  const stripThinking = (el) => {
+    if (!el) return '';
+    let clone;
+    try { clone = el.cloneNode(true); } catch (e) { return el.innerText || ''; }
+    // 1) 常见的类名标记（ds-think / thinking / reasoning / details 折叠块）
+    try {
+      clone.querySelectorAll('[class*="think" i],[class*="reason" i],details').forEach((n) => n.remove());
+    } catch (e) { /* 老内核不支持 i 标志就跳过 */ }
+    // 2) 兜底：按文案剔掉"已深度思考（用时 X 秒）…"那一段
+    try {
+      clone.querySelectorAll('div,section,li,p,span').forEach((n) => {
+        const t = (n.textContent || '').trim();
+        if (!t) return;
+        if (t.startsWith('已深度思考') || t.startsWith('深度思考') || /^Thinking\b/i.test(t)) n.remove();
+      });
+    } catch (e) { /* 忽略 */ }
+    return (clone.innerText || clone.textContent || '').trim();
+  };
   const api = {
     input: () => [...document.querySelectorAll('textarea[placeholder]')].find(vis) || null,
     blocks: () => [...document.querySelectorAll('[class*="ds-markdown"]')],
@@ -472,7 +554,7 @@ const HELPERS = `(() => {
     },
     lastText: () => {
       const bs = api.blocks();
-      return bs.length ? (bs[bs.length - 1].innerText || '') : '';
+      return bs.length ? stripThinking(bs[bs.length - 1]) : '';
     },
     /**
      * 助手回复块。注意：一条回复在 DOM 里是**两层嵌套**的 ds-markdown
@@ -485,7 +567,7 @@ const HELPERS = `(() => {
     replyTextAt: (i) => {
       const rs = api.replies();
       if (i < 0 || i >= rs.length) return null;
-      return rs[i].innerText || '';
+      return stripThinking(rs[i]);
     },
     /**
      * 助手回复的快照：按"纵向位置"去重后返回文本数组。
@@ -497,7 +579,7 @@ const HELPERS = `(() => {
       for (const el of api.replies()) {
         const r = el.getBoundingClientRect();
         const key = Math.round(r.top);
-        const text = el.innerText || '';
+        const text = stripThinking(el);
         const prev = seen.get(key);
         if (prev === undefined || text.length > prev.length) seen.set(key, text);
       }
@@ -576,7 +658,7 @@ class Bridge {
           // 只留最近一批：抓取逻辑是按索引基线取新增的，老数据没有用了
           if (this.netBodies.length > 50) this.netBodies = this.netBodies.slice(-50);
           logLine(
-            `completion 响应体 #${this.netBodies.length}：${body.length} 字节 / 文本 ${parsed.text.length} 字 / fragments=${parsed.frags} / closed=${parsed.closed} / msgId=${parsed.messageId}`
+            `completion 响应体 #${this.netBodies.length}：${body.length} 字节 / 文本 ${parsed.text.length} 字 / 思考 ${(parsed.thinking||'').length} 字 / fragments=${parsed.frags} / closed=${parsed.closed} / msgId=${parsed.messageId}`
           );
         } else {
           logLine(`completion 响应里没解析出文本（${body.length} 字节）`);
@@ -979,7 +1061,12 @@ class Bridge {
     // 但接口一直是好的 —— 实测页面 DOM 里 0 个消息块、completion 却 200 返回了完整回复。
     // 注意要挑 **closed=true**（SSE 里有 event: close）的那份，否则可能只拿到
     // 流式过程中的一小段（实测抓到过只有 5 个字的片段）。
-    const closedBody = this.netBodies.slice(bodiesBefore).filter((b) => b.closed).pop();
+    // 注意：一轮里会有**两份** completion 响应 —— 一份只有 THINK（深度思考），
+    // 一份才是正文。必须跳过 text 为空的，否则会把思考内容当成回复。
+    const closedBody = this.netBodies
+      .slice(bodiesBefore)
+      .filter((b) => b.closed && b.text && b.text.length > 0)
+      .pop();
     if (closedBody) {
       logLine(`本轮回复直接来自接口（完整，${closedBody.text.length} 字）`);
       this.finishReply(closedBody.text, false);
@@ -998,7 +1085,7 @@ class Bridge {
         return;
       }
       const fresh = this.netBodies.slice(before);
-      const closed = fresh.filter((b) => b.closed).pop();
+      const closed = fresh.filter((b) => b.closed && b.text && b.text.length > 0).pop();
       if (closed) {
         clearInterval(tick);
         logLine(`等到了完整接口回复（${closed.text.length} 字）`);

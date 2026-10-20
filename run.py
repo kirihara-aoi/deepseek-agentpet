@@ -1687,22 +1687,6 @@ class PetHost:
             self.post({"t": "card", "open": self.inline_card_open})
             # 界面刚（重新）加载完：把说话按钮的显示状态同步过去
             self.apply_chat_button()
-            # 自检用：CODEXPET_BASIN_TEST=延迟秒数 时自动扣一次铁盆（便于截图核对）
-            _bt = os.environ.get("CODEXPET_BASIN_TEST")
-            if _bt:
-                try:
-                    _delay = float(_bt)
-                except ValueError:
-                    _delay = 5.0
-                log("自检：%.1f 秒后自动扣一次铁盆" % _delay)
-
-                def _basin_test() -> None:
-                    self.post({"t": "basin-drop"})
-
-
-
-
-                self._after(_delay, _basin_test)
 
         elif kind == "status":
             self.status = msg.get("data") or {}
@@ -1959,7 +1943,7 @@ class PetHost:
                 log("收到停止请求，退出桌宠")
                 self.form.Close()
                 return
-        if self.desktops and self.settings.get("followDesktop", True) and now - self.last_follow > 0.6:
+        if self.desktops and self.settings.get("followDesktop", True) and now - self.last_follow > 1.2:
             self.last_follow = now
             self.ui_phase("follow-desktop")
             self.desktops.follow(hwnd)
@@ -4561,7 +4545,8 @@ class PetHost:
         self.post({"t": "notice", "show": False})
 
     def find_dsh_web_window(self, port: int | None = None, kind: str = "dsh",
-                            include_minimized: bool = False, use_cache: bool = True):
+                            include_minimized: bool = False, use_cache: bool = True,
+                            ttl: float = 0.3):
         """找浏览器里 **DSH 页** 或 **chat.deepseek.com 聊天页** 对应的窗口。
 
         kind="dsh"  → 只认 DSH 页面（http://127.0.0.1:3080/），标题里通常带
@@ -4588,7 +4573,7 @@ class PetHost:
             cache = self._dsh_win_cache = {}
         if use_cache:
             hit_c = cache.get(cache_key)
-            if hit_c is not None and now - hit_c[0] < 0.3:
+            if hit_c is not None and now - hit_c[0] < ttl:
                 return hit_c[1]
         result = self._find_dsh_web_window_uncached(port, kind, include_minimized)
         cache[cache_key] = (now, result)
@@ -4893,7 +4878,9 @@ class PetHost:
         if not self.dsh_web_ready_cached():
             return
         try:
-            hit = self.find_dsh_web_window(kind="dsh")
+            # ttl=0.55：窗口枚举一次要几十毫秒，而迟滞门槛是 0.30/0.50 秒，
+            # 放宽到 0.55 秒后判定延迟基本不变，界面线程上的枚举开销直接减半。
+            hit = self.find_dsh_web_window(kind="dsh", ttl=0.55)
         except Exception as exc:  # noqa: BLE001
             self.detach_dsh_watch()
             log("查 DeepSeek Harness 窗口失败，置顶监视已停：%r" % (exc,))
@@ -5761,7 +5748,10 @@ class PetHost:
         # DSH 按钮只认真正的 DSH 页（标题带 "DeepSeek Harness"）。
         # 以前这里回退 kind="any"，会把 chat.deepseek.com 聊天页（标题带 "DeepSeek"）
         # 也匹配上，于是按 DSH 按钮反而跳到 DS 专属 Edge（用户实测反馈）。
-        hit = self.find_dsh_web_window(port, kind="dsh", use_cache=False, include_minimized=True)
+        # 这里在界面线程上：use_cache=False 会强制 EnumWindows（实测 48~65ms，
+        # 鼠标会顿一下）。复用缓存即可 —— 最坏只是用到 0.3~0.55 秒前的窗口句柄，
+        # 对"切到 DSH 窗口"这个动作没影响。
+        hit = self.find_dsh_web_window(port, kind="dsh", use_cache=True, include_minimized=True)
         if hit:
             self._activate_window(hit[1], maximize=True)
             self.set_dsh_watch_present(True)

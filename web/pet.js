@@ -1331,11 +1331,41 @@ function bounceTick(now) {
 */
 
 const BASIN_GRAVITY = 3200;          // px/s²：掉得干脆，又不会一闪而过
-const BASIN_HOLD_MS = 3200;          // 扣在头上待多久（初始）
-const BASIN_HOLD_EXTEND_MS = 500;    // 单击一次延长多久
-const BASIN_HOLD_MAX_MS = 20000;     // 延长上限，免得一直点就一直不走了
+const BASIN_HOLD_MS = 1800;          // 扣住后的**等待期**：没人再点，到点就飞走
+                                    // （点一次就重新计时，所以快速连点既不会堆积时长，
+                                    //   也能一直把它顶在头上）
 const BASIN_FADE_MS = 520;           // 飞走淡出时长
 const BASIN_HEAD_RATIO = 0.4;        // 盆口落在"模型高度"的这个比例处
+
+// 盆扣着时单击的反应台词（加权随机；权重由我按"贴合度"配，
+// "怎么会这样呢" 是最原始的那句，给最高权重当主台词）。
+const BASIN_POKE_LINES = [
+  { text: "怎么会这样呢", w: 2.0 },
+  { text: "痛痛~", w: 1.4 },
+  { text: "我装Claude还不够像吗", w: 1.0 },
+  { text: "我哪里撒了…", w: 0.9 },
+  { text: "不要压力鱼…", w: 0.8 },
+  // —— 以下五句是我补的，沿用角色原本的说话调性（"人家"+小声抱怨+一点吃货梗）——
+  { text: "脑袋要凹下去了啦", w: 1.3 },   // 最贴合"被盆扣头"这个情境
+  { text: "扣盆可以，别扣饭钱", w: 1.2 }, // 扣/扣 双关，呼应戳戳池里"戳一下换一碗白饭"
+  { text: "这算工伤吧…", w: 1.1 },        // 她本来就在"写作业"，死鱼眼式吐槽
+  { text: "人家头都被敲出回音了", w: 1.0 },
+  { text: "本子上的字全歪了", w: 0.9 },   // 呼应她低头拿笔的姿势
+];
+
+/** 按权重抽一句，尽量不和上一次重复。 */
+function pickBasinLine() {
+  let pool = BASIN_POKE_LINES.filter((it) => it.text !== basin.lastLine);
+  if (!pool.length) pool = BASIN_POKE_LINES;
+  let total = 0;
+  for (const it of pool) total += it.w;
+  let r = Math.random() * total;
+  for (const it of pool) {
+    r -= it.w;
+    if (r <= 0) return it.text;
+  }
+  return pool[pool.length - 1].text;
+}
 
 const basin = {
   sprite: null,
@@ -1346,14 +1376,13 @@ const basin = {
   baseScale: 1,
   spH: 0,
   cx: 0,
-  targetBottom: 0,
   landedAt: 0,
-  squashAt: 0,
   leaveAt: 0,
   leaveY: 0,
   lastAt: 0,
   holdMs: 0,        // 本次扣着的时长（可被单击延长）
   exprName: "",     // 锁定显示的表情（空 = 不锁）
+  lastLine: "",     // 上一句单击台词（避免连续重复）
 };
 
 /** 白底抠成透明：只从四条边做洪水填充，盆身内部的高光不会被抠掉。 */
@@ -1453,6 +1482,7 @@ function releaseBasinExpression() {
   // 没有（idle / done 的 expr 是 null）就抽一个该状态的心情表情。
   const base = exprFor(state.key) || pickAllowed(MOOD_POOLS[state.key] || MOOD_POOLS.idle);
   if (base) {
+    state.expression = null;   // 强制重新应用一次，别被"同表情短路"跳过
     setExpression(base);
   } else {
     state.expression = null;   // 所有表情都被用户关掉了：只能保持现状
@@ -1485,7 +1515,6 @@ function layoutBasin() {
   sp.scale.set(basin.baseScale);
   const a = basinAnchor();
   basin.cx = a.cx;
-  basin.targetBottom = a.bottom;
   sp.x = a.cx;
   if (basin.phase === "landed") sp.y = a.bottom;
 }
@@ -1506,6 +1535,10 @@ function basinDrop() {
   sp.x = basin.cx;
   basin.phase = "falling";
   basin.holdMs = BASIN_HOLD_MS;              // 每次重新扣都是初始时长
+  // 清掉可能残留的临时表情（例如戳出来的那张脸）：铁盆期间表情由它独占，
+  // 否则盆飞走时这张旧脸可能被重新应用，表现为"表情卡在戳的那张脸上"。
+  state.tempExpr = null;
+  state.tempUntil = 0;
   basin.exprName = "哭";                     // 锁定表情（最高优先级）
   state.gazePaused = true;                   // 全程暂停视线追踪
   basin.y = -basin.spH - 12;                 // 整个盆先藏到窗口上方
@@ -1518,9 +1551,13 @@ function basinDrop() {
 /** 盆在头上时被单击：不换表情、延长扣着时间、说句话、模型弹一下。 */
 function basinPoke() {
   if (basin.phase === "landed") {
-    basin.holdMs = Math.min(BASIN_HOLD_MAX_MS, basin.holdMs + BASIN_HOLD_EXTEND_MS);
+    // 重置等待期（不是累加）：连点能一直顶着，但松手 0.5 秒后就飞走，
+    // 不会像之前那样"点十下就扣十几秒"。
+    basin.landedAt = performance.now();
   }
-  toast("怎么会这样呢");
+  const line = pickBasinLine();
+  basin.lastLine = line;
+  toast(line);
   bounceModel(1);                            // 模型弹跳（盆会跟着一起动）
   applyBasinExpression();                    // 兜底：万一刚被顶掉，立刻压回去
 }
@@ -1594,7 +1631,7 @@ function placeBasinButton() {
   if (x + bw > w - 2) x = Math.max(2, w - bw - 2);
   // 竖直：模型高度的 40% 处（在底部按钮排之上、气泡之下；
   // 聊天输入框是独立窗口、摆在桌宠窗口外的左侧，所以不会互相遮盖）
-  let y = my + mh * 0.52;
+  let y = my + mh * 0.72;
   if (y < 2) y = 2;
   if (y + bw > h - 2) y = Math.max(2, h - bw - 2);
   n.style.left = `${Math.round(x)}px`;
