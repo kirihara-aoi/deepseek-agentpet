@@ -101,6 +101,7 @@ const ui = {
   toast: el("toast"),
   cardClose: el("card-close"),
   cardBtn: el("card-btn"),
+  basinBtn: el("basin-btn"),
   notice: el("notice"),
   noticeTitle: el("notice-title"),
   noticeBody: el("notice-body"),
@@ -162,6 +163,7 @@ const state = {
     clamped: false, distance: 0,
   },
   gazeAt: 0,
+  gazePaused: false,   // 铁盆扣头期间暂停视线追踪
   fpsLimit: 60,
   attention: true,       // 现在需不需要满帧（鼠标在桌宠上 / 有弹窗）
   idleSince: 0,          // 从什么时候开始"没人看"
@@ -443,6 +445,8 @@ async function boot() {
   installPlaybackGuards();
   installParamBlockPatch();
   layout();
+  // 铁盆素材等启动稳定后再加载（抠图是一次性 CPU 工作，别和启动抢主线程）
+  setTimeout(loadBasin, 1500);
   window.addEventListener("resize", () => {
     app.renderer.resize(window.innerWidth, window.innerHeight);
     updateCardDensity();
@@ -465,6 +469,7 @@ async function boot() {
   const shared = PIXI.Ticker.shared;
   shared.add(updateGaze, null, 10);
   shared.add(applyBlockedParams, null, 11);
+  shared.add(basinTick, null, 12);   // 铁盆下落/落地（在渲染之前）
   shared.add(countFrame, null, 99);        // 数帧：给设置页显示"当前 fps"
   if (app.ticker && app.ticker !== shared) {
     app.ticker.add(updateGaze, null, 10);
@@ -742,6 +747,8 @@ function layout() {
     }
   };
   placeRow([ui.chatBtn, ui.dshBtn, ui.deepseekBtn, ui.cardBtn]);
+  placeBasinButton();
+  layoutBasin();
   // 排查用：把这次布局的关键数字记下来（window.__petLayout 可被读出来核对）
   window.__petLayout = {
     window: [w, h],
@@ -848,6 +855,7 @@ function reportHitbox() {
     // 任务进度卡片：关闭键 + 第 4 个按钮（都由宿主钩子命中）
     cardCloseRect: state.cardOpen ? btnRect(ui.cardClose) : null,
     cardBtnRect: keyRect(ui.cardBtn),
+    basinBtnRect: keyRect(ui.basinBtn),
     dpr: window.devicePixelRatio || 1,
   };
   // 完全没变化就不发：鼠标静止时这份数据是死的，每 220ms 发一次纯属浪费
@@ -943,9 +951,10 @@ function scheduleIdle() {
 
 function setTempExpression(name, seconds) {
   if (!name) return false;
+  if (!expressionAllowed(name)) return false;
   state.tempExpr = name;
   state.tempUntil = Date.now() + seconds * 1000;
-  state.expression = null;
+  state.expression = null;   // 先清标记，否则 setExpression 会因"同表情"短路
   setExpression(name);
   return true;
 }
@@ -958,6 +967,7 @@ function setTempExpression(name, seconds) {
  * 于是看起来就是"表情卡住不复原"（用户反馈）。这里补上到期还原。
  */
 function tempExprTick() {
+  if (expressionLocked()) return;               // 铁盆扣着期间不许到期复原
   if (!state.tempExpr) return;
   if (Date.now() < state.tempUntil) return;
   state.tempExpr = null;
@@ -980,6 +990,7 @@ function tempExprTick() {
 
 function moodTick() {
   if (!model) return;
+  if (expressionLocked()) return;               // 铁盆表情优先，随机心情别来抢
   if (state.settings && state.settings.autoExpression === false) return;
   if (Date.now() < state.tempUntil) return;      // 正在演临时情绪（拖动/被戳/害羞）
   if (Date.now() - state.moodAt < moodIntervalMs()) return;
@@ -1016,7 +1027,7 @@ function onCursor(data) {
     if (!state.hoverSince) state.hoverSince = now;
     // 被盯着看了一会儿：偶尔害羞一下
     const autoExpression = !state.settings || state.settings.autoExpression !== false;
-    if (autoExpression && now - state.hoverSince > 2600 && now - state.lastShy > 22000 && Date.now() > state.tempUntil) {
+    if (autoExpression && !expressionLocked() && now - state.hoverSince > 2600 && now - state.lastShy > 22000 && Date.now() > state.tempUntil) {
       state.lastShy = now;
       const shyFace = pickAllowed(SHY_MOODS);
       setTempExpression(shyFace, 1.4);
@@ -1043,6 +1054,21 @@ function updateGaze() {
   if (!model) return;
   const g = state.gaze;
   const now = performance.now();
+  if (state.gazePaused) {
+    // 铁盆下落/扣着/飞走全过程：不做视线追踪，眼睛回正并保持住。
+    // 只在有必要时写参数（避免每帧白写）。
+    if (g.phase !== "rest" || g.ratioX || g.ratioY || g.headX || g.headY || g.bodyX) {
+      restGaze(g);
+      g.x = 0;
+      g.y = 0;
+      g.distance = 0;
+      g.clamped = false;
+      applyGazeParameters(g);
+    }
+    state.gazeAt = now;
+    effectsTick(now);      // 视线暂停，但弹跳/爱心/表情到期仍要照常推进
+    return;
+  }
   const dt = clamp(((now - state.gazeAt) || 0) / 1000, 0, GAZE_MAX_STEP);
   state.gazeAt = now;
 
@@ -1294,6 +1320,287 @@ function bounceTick(now) {
   if (state.bounceBottom) model.y = state.bounceBottom - baseH * sy;   // 底边固定
 }
 
+/* ---------------------------------------------------------------- 铁盆特效
+
+   点左边的红色按钮 → 不锈钢盆从模型正上方砸下来，扣在头上；扣上瞬间模型弹跳。
+
+   为什么用 PIXI 精灵而不是 DOM + CSS：
+     · 桌宠是色键透明的分层窗口，DOM 上的 transform 会让 DWM 重新合成整个窗口
+       （之前"鼠标划过按钮卡顿"就是这个根因），所以这类动画绝不能走 CSS transform；
+     · 模型本身就是 PIXI 精灵，铁盆走同一条渲染路径，叠加顺序与边缘表现都一致。
+*/
+
+const BASIN_GRAVITY = 3200;          // px/s²：掉得干脆，又不会一闪而过
+const BASIN_HOLD_MS = 3200;          // 扣在头上待多久（初始）
+const BASIN_HOLD_EXTEND_MS = 500;    // 单击一次延长多久
+const BASIN_HOLD_MAX_MS = 20000;     // 延长上限，免得一直点就一直不走了
+const BASIN_FADE_MS = 520;           // 飞走淡出时长
+const BASIN_HEAD_RATIO = 0.4;        // 盆口落在"模型高度"的这个比例处
+
+const basin = {
+  sprite: null,
+  ready: false,
+  phase: "idle",      // idle | falling | landed | leaving
+  y: 0,
+  vy: 0,
+  baseScale: 1,
+  spH: 0,
+  cx: 0,
+  targetBottom: 0,
+  landedAt: 0,
+  squashAt: 0,
+  leaveAt: 0,
+  leaveY: 0,
+  lastAt: 0,
+  holdMs: 0,        // 本次扣着的时长（可被单击延长）
+  exprName: "",     // 锁定显示的表情（空 = 不锁）
+};
+
+/** 白底抠成透明：只从四条边做洪水填充，盆身内部的高光不会被抠掉。 */
+function basinKeyOutWhite(img) {
+  // 先降采样再抠：原图 1499×987（148 万像素）逐像素洪水填充要上百毫秒，
+  // 而实际显示宽度只有 ~200px —— 降到 800 宽既够清晰，又把工作量和纹理内存砍掉。
+  const srcW = img.naturalWidth || img.width;
+  const srcH = img.naturalHeight || img.height;
+  const k = Math.min(1, 800 / srcW);
+  const w = Math.max(1, Math.round(srcW * k));
+  const h = Math.max(1, Math.round(srcH * k));
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, 0, 0, w, h);
+  const data = ctx.getImageData(0, 0, w, h);
+  const px = data.data;
+  const seen = new Uint8Array(w * h);
+  const stack = [];
+  const nearWhite = (idx) => {
+    const i = idx * 4;
+    return px[i] > 228 && px[i + 1] > 228 && px[i + 2] > 228;
+  };
+  const visit = (x, y) => {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    const idx = y * w + x;
+    if (seen[idx]) return;
+    seen[idx] = 1;
+    if (!nearWhite(idx)) return;
+    stack.push(idx);
+  };
+  for (let x = 0; x < w; x += 1) { visit(x, 0); visit(x, h - 1); }
+  for (let y = 0; y < h; y += 1) { visit(0, y); visit(w - 1, y); }
+  while (stack.length) {
+    const idx = stack.pop();
+    px[idx * 4 + 3] = 0;
+    const x = idx % w;
+    const y = (idx - x) / w;
+    visit(x + 1, y);
+    visit(x - 1, y);
+    visit(x, y + 1);
+    visit(x, y - 1);
+  }
+  ctx.putImageData(data, 0, 0);
+  return c;
+}
+
+async function loadBasin() {
+  try {
+    const img = new Image();
+    img.src = "basin.png";
+    if (img.decode) {
+      await img.decode();
+    } else {
+      await new Promise((res, rej) => { img.onload = res; img.onerror = rej; });
+    }
+    const tex = PIXI.Texture.from(basinKeyOutWhite(img));
+    const sp = new PIXI.Sprite(tex);
+    sp.anchor.set(0.5, 1.0);   // 锚点放盆口底边：扣在头上时 y 就是盆口高度
+    sp.visible = false;
+    app.stage.addChild(sp);    // 最后 add → 盖在模型上面
+    basin.sprite = sp;
+    basin.ready = true;
+    layoutBasin();
+  } catch (e) {
+    console.warn("铁盆素材加载失败（按钮仍可点，只是没有特效）", e);
+  }
+}
+
+/** 铁盆表情是否处于"最高优先级"锁定状态。
+
+    盆在下落/扣着/飞走期间，它的表情不许被状态刷新、随机心情、戳 改掉。
+    （之前"有概率被顶掉"就是这些来源。） */
+function expressionLocked() {
+  return Boolean(basin.exprName) && basin.phase !== "idle";
+}
+
+/** 应用（或重新压回）铁盆锁定的表情。 */
+function applyBasinExpression() {
+  if (!basin.exprName) return;
+  if (state.expression === basin.exprName) return;
+  state.expression = null;         // 先清标记，否则 setExpression 会因"同表情"短路
+  setExpression(basin.exprName);
+}
+
+/** 盆走了：解除锁定并恢复当前状态该有的表情。 */
+function releaseBasinExpression() {
+  basin.exprName = "";
+  state.tempExpr = null;      // 清掉可能残留的临时表情，别挡住复原
+  state.tempUntil = 0;
+  state.expression = null;
+  // 复原时**绝不能用 resetExpression()**：实测它会让之后所有 model.expression()
+  // 都不再生效 —— 表现就是"盆飞走后再按盆，表情就不变了"（用户反馈）。
+  // 所以这里必须落到一个**具体的表情名**上：优先当前状态的基础表情，
+  // 没有（idle / done 的 expr 是 null）就抽一个该状态的心情表情。
+  const base = exprFor(state.key) || pickAllowed(MOOD_POOLS[state.key] || MOOD_POOLS.idle);
+  if (base) {
+    setExpression(base);
+  } else {
+    state.expression = null;   // 所有表情都被用户关掉了：只能保持现状
+  }
+  state.moodAt = Date.now();  // 复原后先安静一会儿，别立刻被随机心情换掉
+}
+
+/** 模型"头部"锚点（盆口应该贴到的位置 + 水平中心）。
+
+    **每帧现算**：模型弹跳/缩放时 scale 和 y 都在变，盆必须跟着变，
+    这样"盆和模型的相对位置"才始终不变（用户要求）。 */
+function basinAnchor() {
+  if (!model || !model.internalModel) return { cx: 0, bottom: 0 };
+  const baseW = model.internalModel.width * model.scale.x;
+  const baseH = model.internalModel.height * model.scale.y;
+  return {
+    cx: model.x + baseW / 2,
+    bottom: model.y + baseH * BASIN_HEAD_RATIO,
+  };
+}
+
+/** 让盆的大小跟着模型走（模型整体缩放/卡片开合时调用）。 */
+function layoutBasin() {
+  const sp = basin.sprite;
+  if (!sp || !model) return;
+  const mw = model.width;
+  const wantW = Math.max(52, mw * 0.58);        // 比头略宽，扣得住
+  basin.baseScale = wantW / sp.texture.width;
+  basin.spH = sp.texture.height * basin.baseScale;
+  sp.scale.set(basin.baseScale);
+  const a = basinAnchor();
+  basin.cx = a.cx;
+  basin.targetBottom = a.bottom;
+  sp.x = a.cx;
+  if (basin.phase === "landed") sp.y = a.bottom;
+}
+
+function basinBusy() {
+  return Boolean(basin.sprite) && (basin.phase === "falling" || basin.phase === "landed");
+}
+
+function basinDrop() {
+  const sp = basin.sprite;
+  if (!sp || !basin.ready) return;
+  // 已经扣着/正在掉/正在飞走时再按一次：**重新砸一次**，而不是毫无反应。
+  // 原来这里直接 return，而整个盆序列要 3.7 秒，用户连按两次会觉得"第二次没反应"。
+  layoutBasin();
+  sp.visible = true;
+  sp.alpha = 1;
+  sp.scale.set(basin.baseScale);
+  sp.x = basin.cx;
+  basin.phase = "falling";
+  basin.holdMs = BASIN_HOLD_MS;              // 每次重新扣都是初始时长
+  basin.exprName = "哭";                     // 锁定表情（最高优先级）
+  state.gazePaused = true;                   // 全程暂停视线追踪
+  basin.y = -basin.spH - 12;                 // 整个盆先藏到窗口上方
+  basin.vy = 180;                            // 给一点初速，掉得利落
+  basin.lastAt = performance.now();
+  sp.y = basin.y;
+  applyBasinExpression();                    // 从下落开始就保持哭
+}
+
+/** 盆在头上时被单击：不换表情、延长扣着时间、说句话、模型弹一下。 */
+function basinPoke() {
+  if (basin.phase === "landed") {
+    basin.holdMs = Math.min(BASIN_HOLD_MAX_MS, basin.holdMs + BASIN_HOLD_EXTEND_MS);
+  }
+  toast("怎么会这样呢");
+  bounceModel(1);                            // 模型弹跳（盆会跟着一起动）
+  applyBasinExpression();                    // 兜底：万一刚被顶掉，立刻压回去
+}
+
+function basinTick() {
+  const sp = basin.sprite;
+  if (!sp || !basin.ready || basin.phase === "idle") return;
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - (basin.lastAt || now)) / 1000);
+  basin.lastAt = now;
+  const a = basinAnchor();
+
+  if (basin.phase === "falling") {
+    basin.vy += BASIN_GRAVITY * dt;      // 重力积分：越掉越快
+    basin.y += basin.vy * dt;
+    if (basin.y >= a.bottom) {
+      basin.y = a.bottom;
+      basin.phase = "landed";
+      basin.landedAt = now;
+      bounceModel(1.2);                  // 扣上瞬间：**只有模型弹跳**（盆跟着模型走）
+      toast("咣当");                     // 反应文字
+    }
+    sp.x = a.cx;
+    sp.y = basin.y;
+    return;
+  }
+
+  if (basin.phase === "landed") {
+    // 每帧贴合模型：弹跳（压扁/拉伸）、整体缩放时，盆与模型的相对位置都保持不变
+    sp.x = a.cx;
+    sp.y = a.bottom;
+    sp.scale.set(basin.baseScale);
+    if (now - basin.landedAt > basin.holdMs) {
+      basin.phase = "leaving";
+      basin.leaveAt = now;
+      basin.leaveY = sp.y;
+    }
+    return;
+  }
+
+  // leaving：被"顶"起来飞走并淡出，别把脸一直挡着
+  const t = (now - basin.leaveAt) / BASIN_FADE_MS;
+  if (t >= 1) {
+    basin.phase = "idle";
+    sp.visible = false;
+    sp.alpha = 1;
+    sp.scale.set(basin.baseScale);
+    state.gazePaused = false;      // 盆飞走了：恢复视线追踪
+    releaseBasinExpression();      // 解除表情锁定，恢复基础表情
+    return;
+  }
+  const k = t * t;
+  sp.y = basin.leaveY - k * (basin.spH + 60);
+  sp.alpha = 1 - t;
+}
+
+/** 铁盆按钮摆在模型左侧：贴着模型左边缘，允许压住一点点模型。 */
+function placeBasinButton() {
+  const n = ui.basinBtn;
+  if (!n) return;
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  const bw = 34;
+  const mw = model ? model.width : w;
+  const mh = model ? model.height : h;
+  const mx = model ? model.x : 0;
+  const my = model ? model.y : 0;
+  // 与模型左边缘重叠 20px（用户要求：再往右一点、适当覆盖模型）
+  let x = mx - bw + 20;
+  if (x < 2) x = 2;
+  if (x + bw > w - 2) x = Math.max(2, w - bw - 2);
+  // 竖直：模型高度的 40% 处（在底部按钮排之上、气泡之下；
+  // 聊天输入框是独立窗口、摆在桌宠窗口外的左侧，所以不会互相遮盖）
+  let y = my + mh * 0.52;
+  if (y < 2) y = 2;
+  if (y + bw > h - 2) y = Math.max(2, h - bw - 2);
+  n.style.left = `${Math.round(x)}px`;
+  n.style.top = `${Math.round(y)}px`;
+}
+
 function applyGazeParameters(g) {
   const core = model && model.internalModel && model.internalModel.coreModel;
   if (!core) {
@@ -1310,13 +1617,22 @@ function applyGazeParameters(g) {
   setParam(core, "ParamAngleY", -g.headY * GAZE_SCALE_HEAD);
   setParam(core, "ParamAngleZ", g.headX * GAZE_SCALE_HEAD * 0.25);
   setParam(core, "ParamBodyAngleX", g.bodyX * GAZE_SCALE_HEAD * 0.3);
-  heartBurstTick(core, performance.now());
-  bounceTick(performance.now());
-  // 到期复原**每帧**检查一次：原来挂在 2.5 秒的定时器上，表情到期后最长还要再等
-  // 2.5 秒才清掉，观感上就是"改了表情很久不恢复"。这个函数内部先判空/判未到期，
-  // 绝大多数帧是零开销。
-  tempExprTick();
+  effectsTick(performance.now());
   window.__gazeDebug = { error: null, phase: g.phase, written: g.x, readBack: readParam(core, "ParamEyeBallX") };
+}
+
+/** 每帧的特效收尾：爱心爆发、模型弹跳、临时表情到期复原。
+
+    这几个原本直接写在 applyGazeParameters 里，但**铁盆期间视线是暂停的**
+    （updateGaze 会提前 return），于是 model 弹跳根本不会播 ——
+    用户反馈"扣上时模型没有弹跳"就是这个原因。所以抽出来两边都要调。 */
+function effectsTick(now) {
+  const core = model && model.internalModel && model.internalModel.coreModel;
+  if (core) heartBurstTick(core, now);
+  bounceTick(now);
+  // 到期复原**每帧**检查一次：原来挂在 2.5 秒的定时器上，表情到期后最长还要再等
+  // 2.5 秒才清掉，观感上就是"改了表情很久不恢复"。内部先判空/判未到期，绝大多数帧零开销。
+  tempExprTick();
 }
 
 function setParam(core, id, value) {
@@ -1389,14 +1705,17 @@ function applyState(payload) {
   // **只有状态真的变了**才清掉临时表情。
   // 宿主每秒都会推一次状态（耗时/余额/用量在变），原来每次都清，于是戳出来的表情
   // 活不过一秒就被状态表情顶回去 —— 用户看到的就是"有时候戳了表情不变"。
-  if (changed) {
+  if (changed && !expressionLocked()) {
     state.tempExpr = null;
     state.tempUntil = 0;
     state.moodAt = Date.now();     // 顺带修掉：原来每秒都把 moodAt 刷新，
                                    // 导致随机心情永远等不到间隔、实际几乎不触发
   }
   const tempActive = Boolean(state.tempExpr) && Date.now() < state.tempUntil;
-  if (!tempActive) {
+  if (expressionLocked()) {
+    // 铁盆扣着期间表情最高优先级：状态刷新不许改脸，只把锁定的表情压回去
+    applyBasinExpression();
+  } else if (!tempActive) {
     if (expression) setExpression(expression);
     else if (changed) {
       state.expression = null;
@@ -2199,6 +2518,7 @@ function petBtnNode(which) {
     "approval-close": ui.approvalClose,
     "card-close": ui.cardClose,
     "card-key": ui.cardBtn,
+    basin: ui.basinBtn,
     "scroll-up": ui.chatScrollUp,
     "scroll-down": ui.chatScrollDown,
   };
@@ -2562,6 +2882,11 @@ function pokeAct(hit, ms, withMotion) {
 
 /** 单击身体：完整移植鲸鱼娘的分档逻辑。 */
 function pokeReact() {
+  // 盆在头上时单击走专门的反应：不切表情、延长扣着时间、说"怎么会这样呢"、模型弹跳
+  if (basinBusy()) {
+    basinPoke();
+    return;
+  }
   const now = performance.now();
   const key = state.key || "idle";
   const busy = key !== "idle" && key !== "done";
@@ -2707,6 +3032,7 @@ function applyHostMessage(msg) {
   // 用户点了卡片上的 ✕：只收起，不回应申请
   if (msg.t === "approval-dismiss") approvalDismiss();
   if (msg.t === "pet-btn-hot") petBtnHot(msg.which, msg.hot);
+  if (msg.t === "basin-drop") basinDrop();
   if (msg.t === "pet-btn-press") petBtnPress(msg.which, msg.on);
 }
 

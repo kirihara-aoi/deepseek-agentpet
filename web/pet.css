@@ -1155,3 +1155,36 @@ canvas {
   .chat-bubble-body { max-height: 70px; }
   .approval-detail { max-height: 44px; }
 }
+
+/* 铁盆按钮（模型左侧，红色）。
+   同 .pet-key-btn：**只用颜色类属性做动画，绝不要用 transform** ——
+   桌宠是色键透明的分层窗口，transform 会触发 DWM 重新合成整个窗口（会卡）。 */
+.basin-btn {
+  position: absolute;
+  z-index: 4;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff3f3;
+  background: rgba(198, 54, 54, 0.95);
+  border: 1px solid rgba(255, 136, 136, 0.8);
+  box-shadow: 0 6px 18px rgba(110, 8, 8, 0.45);
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.basin-btn.hot {
+  background: rgba(228, 68, 68, 0.98);
+  border-color: rgba(255, 176, 176, 0.95);
+}
+
+.basin-btn.press {
+  background: rgba(170, 36, 36, 0.98);
+  border-color: rgba(255, 150, 150, 0.9);
+}

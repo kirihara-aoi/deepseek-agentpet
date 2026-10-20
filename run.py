@@ -954,6 +954,7 @@ class PetHost:
         self._approval_watcher = None      # DSH 权限监听（懒启动，见 approval_watcher()）
         self.dsh_btn_rect = None           # 「切到 DSH 网页版」按钮矩形
         self.deepseek_btn_rect = None      # 「切到 chat.deepseek.com」按钮矩形
+        self.basin_btn_rect = None         # 「扣铁盆」按钮矩形
         self._bubble_scroll_pending = 0.0  # 气泡滚动位移，按 tick 推给网页
         self._chat_bridge = None       # chat.deepseek.com 桥接（懒加载，见 chat_bridge()）
         self._chat_window = None       # 聊天输入窗口（懒加载）
@@ -1026,6 +1027,9 @@ class PetHost:
         self._cache_size_ready = False
         self.form_input_works = False
         self._page_ready = False          # 页面发过消息了吗（没起来之前别往 WebView2 发）
+        self._core = None                 # 缓存的 CoreWebView2（避免每帧跨进程 COM 访问）
+        self._step_stat = {}              # 界面线程各阶段耗时统计：name -> [n, sum_ms, max_ms]
+        self._phase_t = 0.0
         self._closing = False             # 正在关闭：钩子回调直接放行
         # 全屏程序让位（游戏/播放器在前时隐藏、暂停渲染、摘钩子）
         self._fullscreen_present = False
@@ -1383,6 +1387,7 @@ class PetHost:
             self.report_fatal("WebView2 初始化失败", args.InitializationException)
             return
         self._webview_init_tries = 0
+        self._core = core
         core.Settings.AreDefaultContextMenusEnabled = False
         core.Settings.IsZoomControlEnabled = False
         core.Settings.AreDevToolsEnabled = bool(os.environ.get("CODEXPET_DEVTOOLS"))
@@ -1484,6 +1489,7 @@ class PetHost:
 
     def on_page_navigation_starting(self, sender, args) -> None:
         """导航开始：页面正在重新加载，先别往它发消息。"""
+        self._core = None                 # 导航后旧的 CoreWebView2 引用作废
         if self._page_ready:
             self._page_ready = False
             log("页面开始重新加载：暂停向页面发消息，等它回来再继续")
@@ -1572,6 +1578,7 @@ class PetHost:
                 ("cardBtnRect", "card_btn_rect"),
                 ("dshBtnRect", "dsh_btn_rect"),
                 ("deepseekBtnRect", "deepseek_btn_rect"),
+                ("basinBtnRect", "basin_btn_rect"),
             ):
                 r = msg.get(key)
                 setattr(
@@ -1598,17 +1605,25 @@ class PetHost:
                 st = self._hook_stat
                 fs = self._flush_stat
                 avg_ms = (fs["sum_ms"] / fs["n"]) if fs["n"] else 0.0
+                # 这一分钟里界面线程哪一步最慢（长时间运行后卡顿就靠它定位）
+                slow_name, slow_ms = "-", 0.0
+                for _n, _v in self._step_stat.items():
+                    if _v[2] > slow_ms:
+                        slow_name, slow_ms = _n, _v[2]
                 log(
                     "渲染 FPS：%.0f（窗口 %dx%d）掉帧 %d 次"
                     "｜钩子回调 %d 次，最长 %.2f ms"
                     "｜发消息 %d 次，平均 %.2f ms，最长 %.1f ms"
                     "｜GC %d 次，最长 %.1f ms"
+                    "｜最慢步骤 %s %.1f ms"
                     % (self.render_fps, self.form.ClientSize.Width, self.form.ClientSize.Height,
                        self.frame_slow_count,
                        st["calls"], st["max_dur"],
                        fs["n"], avg_ms, fs["max_ms"],
-                       _gc_stat["n"], _gc_stat["max_ms"])
+                       _gc_stat["n"], _gc_stat["max_ms"],
+                       slow_name, slow_ms)
                 )
+                self._step_stat.clear()
                 self.frame_max_gap_seen = 0.0
                 st["calls"] = 0
                 st["max_dur"] = 0.0
@@ -1672,6 +1687,23 @@ class PetHost:
             self.post({"t": "card", "open": self.inline_card_open})
             # 界面刚（重新）加载完：把说话按钮的显示状态同步过去
             self.apply_chat_button()
+            # 自检用：CODEXPET_BASIN_TEST=延迟秒数 时自动扣一次铁盆（便于截图核对）
+            _bt = os.environ.get("CODEXPET_BASIN_TEST")
+            if _bt:
+                try:
+                    _delay = float(_bt)
+                except ValueError:
+                    _delay = 5.0
+                log("自检：%.1f 秒后自动扣一次铁盆" % _delay)
+
+                def _basin_test() -> None:
+                    self.post({"t": "basin-drop"})
+
+
+
+
+                self._after(_delay, _basin_test)
+
         elif kind == "status":
             self.status = msg.get("data") or {}
             self.status_ready.set()
@@ -1711,8 +1743,18 @@ class PetHost:
             return
         with self.lock:
             pending, self.queue = self.queue, []
-        if not pending or self.webview is None or self.webview.CoreWebView2 is None:
-            return
+        if not pending:
+            return                      # 没东西要发：连 core 都不碰
+        core = self._core
+        if core is None:
+            # 只有缓存丢了才走这里：self.webview.CoreWebView2 是跨进程 COM 访问，
+            # WebView2 忙的时候可能把界面线程（鼠标钩子宿主）钉住好几秒。
+            if self.webview is None:
+                return
+            core = self.webview.CoreWebView2
+            if core is None:
+                return
+            self._core = core
         # 合并同一类型的多条，只保留最后一条（顺序按各自最后一次出现的位置）
         pending = coalesce_messages(pending, COALESCE_TYPES, COALESCE_BY_KEY)
         # 上一轮明显卡过：先只发"不可丢"的消息，让界面线程喘口气。
@@ -1729,7 +1771,6 @@ class PetHost:
             ]
         if not pending:
             return
-        core = self.webview.CoreWebView2
         # **打包成一次调用**：每一趟 PostWebMessageAsJson 都是界面线程上的同步跨进程
         # 调用，而"鼠标划过按钮 + 视线跟随"这种时刻会同时产生 cursor 与 pet-btn-hot
         # 两条 —— 逐条发就是两次同步调用，打包成数组只算一次。页面侧按顺序拆开处理，
@@ -1779,8 +1820,34 @@ class PetHost:
     # -- per-frame work ------------------------------------------------------
 
     def ui_phase(self, text: str) -> None:
-        """记下界面线程当前在做的事（纯字符串赋值，开销可忽略）。"""
+        """记下界面线程当前在做的事，并把上一个阶段的耗时计入统计。
+
+        原先只记"最后在做"、不量化，卡顿后无法判断到底是哪一步慢。
+        多出来的开销只有一次 perf_counter，可忽略。
+        """
+        t = time.perf_counter()
+        prev = self._phase_t
+        if prev:
+            key = self._ui_phase
+            st = self._step_stat.get(key)
+            if st is None:
+                st = self._step_stat[key] = [0, 0.0, 0.0]
+            ms = (t - prev) * 1000.0
+            st[0] += 1
+            st[1] += ms
+            if ms > st[2]:
+                st[2] = ms
+        self._phase_t = t
         self._ui_phase = text
+
+    def phase_done(self) -> None:
+        """结束当前阶段计时：把这一阶段结算掉，之后的空等不计入任何一步。
+
+        不这么做的话，"从这次回调结束到下次回调开始"的空等（30~110ms）会被算进
+        最后一个阶段，让「最慢步骤」永远是那个无意义的收尾阶段。
+        """
+        self.ui_phase("idle")
+        self._phase_t = 0.0
 
     def on_tick(self, sender, args) -> None:
         now = time.time()
@@ -1789,10 +1856,14 @@ class PetHost:
             # 2 秒以上的严重卡顿归看门狗；0.8~2 秒的小停顿也记一笔，方便对着时间线查
             log("界面线程停顿 %.1f 秒（最后在做：%s）" % (gap, self._ui_phase))
         self._ui_heartbeat = now             # 给看门狗看：界面线程还活着
-        self.ui_phase("界面 tick")
+        self.ui_phase("tick")
+        self.ui_phase("flush")
         self.flush()
+        self.ui_phase("rect-cache")
         self.refresh_rect_cache()
+        self.ui_phase("aux-topmost")
         self._reassert_aux_topmost()      # 卡片/输入框被别的窗口盖住时补回置顶
+        self.ui_phase("render-pause")
         self._sync_render_pause()
         # 兜底：万一抬起事件没来（钩子被摘、远程桌面抢走之类），别让右键一直处于"被吃掉"状态
         if self._right_swallowed and time.time() - self._rs_down_time > 5.0:
@@ -1851,22 +1922,33 @@ class PetHost:
                     self.menu.Close()
                 except Exception as exc:  # noqa: BLE001
                     log("关闭右键菜单失败：%r" % (exc,))
+        self.ui_phase("handle-mouse")
         self.handle_mouse()
+        self.ui_phase("wheel")
         self.drain_wheel()
+        self.ui_phase("bubble-scroll")
         self.drain_bubble_scroll()
+        self.ui_phase("chat-btn")
         self.drain_chat_button()
+        self.ui_phase("pet-btn")
         self.drain_pet_btn()
+        self.ui_phase("pet-btn-hot")
         self.drain_pet_btn_hot()
+        self.ui_phase("dsh-window")
         self.watch_dsh_window()
+        self.ui_phase("fullscreen")
         self.watch_fullscreen()
 
         hwnd = self.form.Handle.ToInt64()
         now = time.time()
+        self.ui_phase("mouse-tick")
         for event in self.mouse.tick(now):        # 单击 / 双击的判定要靠定时器推动
             cursor = wt.POINT()
             user32.GetCursorPos(ctypes.byref(cursor))
             self.on_mouse_event(event, cursor, now)
+        self.ui_phase("cursor")
         self.stream_cursor(now)
+        self.ui_phase("stop-check")
         if now - self.last_stop_check > 0.5:
             self.last_stop_check = now
             if os.path.exists(STOP_FILE):
@@ -1879,6 +1961,7 @@ class PetHost:
                 return
         if self.desktops and self.settings.get("followDesktop", True) and now - self.last_follow > 0.6:
             self.last_follow = now
+            self.ui_phase("follow-desktop")
             self.desktops.follow(hwnd)
 
         if self.card is not None and not self.card.IsDisposed and self.card.Visible:
@@ -1887,6 +1970,7 @@ class PetHost:
             if here != self.last_card_pos:
                 self.apply_card_mode()
                 self.position_card()
+        self.phase_done()
 
     # 鼠标事件不走网页（透明窗口是分层的，子窗口收不到点击），这里直接读键鼠状态来驱动互动
     def handle_mouse(self) -> None:
@@ -2375,6 +2459,8 @@ class PetHost:
                             action = "dsh"
                         elif self.deepseek_btn_rect and self.point_in_rect(self.deepseek_btn_rect, s_xy[0], s_xy[1]):
                             action = "deepseek"
+                        elif self.basin_btn_rect and self.point_in_rect(self.basin_btn_rect, s_xy[0], s_xy[1]):
+                            action = "basin"
                         if action:
                             self._pet_btn_click.append((action, time.time()))
                             self._left_swallowed = True
@@ -2541,7 +2627,7 @@ class PetHost:
         self._hook_proc_install()
 
     def start_hook_watchdog(self) -> None:
-        """鼠标钩子看门狗：界面线程一旦卡住超过 2 秒，先把底层鼠标钩子摘掉。
+        """鼠标钩子看门狗：界面线程一旦卡住超过 0.6 秒，先把底层鼠标钩子摘掉。
 
         为什么要有它：WH_MOUSE_LL 是"系统级"钩子 —— 它的回调必须由安装它的线程
         （也就是界面线程）及时处理。万一界面线程被某个同步调用卡住（比如等一个
@@ -2554,10 +2640,13 @@ class PetHost:
 
         def loop() -> None:
             while True:
-                time.sleep(0.5)
+                time.sleep(0.25)
                 try:
                     gap = time.time() - self._ui_heartbeat
-                    stalled = gap > 2.0
+                    # 0.6 秒就摘钩子（原来 2 秒）：实测 0.9~1.1 秒的停顿已经让鼠标
+                    # 明显冻结，而界面线程卡住期间钩子本来也没法被及时分发，先摘掉
+                    # 让系统不再等我们，鼠标立刻恢复。轮询 0.25s 让发现更及时。
+                    stalled = gap > 0.6
                     if gap > 1.5:
                         self.protect_fps("界面线程停顿 %.1f 秒" % gap)
                     if getattr(self, "_hook_suspended", False):
@@ -2573,7 +2662,7 @@ class PetHost:
                         self._left_swallow_for_button = False
                         self._right_swallowed = False
                         user32.UnhookWindowsHookEx(ctypes.c_void_p(handle))
-                        log("看门狗：界面线程卡住超过 2 秒（最后在做：%s），已临时摘掉鼠标钩子（鼠标应当立刻恢复）" % self._ui_phase)
+                        log("看门狗：界面线程卡住超过 0.6 秒（最后在做：%s），已临时摘掉鼠标钩子（鼠标应当立刻恢复）" % self._ui_phase)
                     elif (not stalled) and self._hook_stalled:
                         self._hook_stalled = False
                         stalled_for = max(0.0, time.time() - getattr(self, "_stall_started", self._ui_heartbeat))
@@ -3299,9 +3388,15 @@ class PetHost:
         if self._pending_menu_at:
             menu_xy, self._pending_menu_at = self._pending_menu_at, None
             self.show_menu(menu_xy[0], menu_xy[1])   # 每次右键都弹，连点也不漏
+        self.ui_phase("cursor-tick")
         self.stream_cursor(time.time())
-        self.handle_mouse()      # 鼠标判定也走 33ms：只靠 110ms 那个 tick 会慢一拍
+        # 鼠标判定也走 33ms：只靠 110ms 那个 tick 会慢一拍
+        self.ui_phase("cursor-tick-mouse")
+        self.handle_mouse()
+        self.ui_phase("cursor-tick-flush")
         self.flush()
+        # 收尾：不加上这一句，flush 的阶段时长会把"到下一次调用的空等"也算进去
+        self.phase_done()
 
     def stream_cursor(self, now: float) -> None:
         """把真实鼠标位置喂给页面，让眼睛能跟着光标转。
@@ -4373,13 +4468,37 @@ class PetHost:
         """
         now = time.time()
         cached = getattr(self, "_dsh_ready_cache", None)
-        if cached is not None:
-            ttl_now = DSH_OFFLINE_TTL if not cached[0] else ttl
-            if now - cached[1] < ttl_now:
-                return cached[0]
-        alive = bool(self.dsh_web_running())
-        self._dsh_ready_cache = (alive, now)
-        return alive
+        if cached is None:
+            self._dsh_probe_async()      # 首次：先给个"未知=没开"，后台补探
+            return False
+        ttl_now = DSH_OFFLINE_TTL if not cached[0] else ttl
+        if now - cached[1] >= ttl_now:
+            self._dsh_probe_async()      # 过期：后台补一次，本次仍返回旧值
+        return cached[0]
+
+    def _dsh_probe_async(self) -> None:
+        """在后台线程探一次 DSH 端口（同一时间只跑一个）。
+
+        **界面线程绝不能直接 socket.create_connection**：端口一时不通时会等满
+        0.35s 超时，而鼠标钩子正是由界面线程分发的 —— 那 350ms 就是"整机鼠标发涩"。
+        """
+        if getattr(self, "_dsh_probe_busy", False):
+            return
+        self._dsh_probe_busy = True
+        port = self.dsh_web_port()
+
+        def probe() -> None:
+            try:
+                alive = bool(self.dsh_web_running(port))
+            except Exception:  # noqa: BLE001
+                alive = False
+            self._dsh_ready_cache = (alive, time.time())
+            self._dsh_probe_busy = False
+
+        try:
+            threading.Thread(target=probe, name="dsh-probe", daemon=True).start()
+        except Exception:  # noqa: BLE001
+            self._dsh_probe_busy = False
 
     # -- DSH 掉线监视 --------------------------------------------------------
 
@@ -5326,6 +5445,7 @@ class PetHost:
                 ("close", "bubble_close_rect"),
                 ("chat", "chat_rect"),
                 ("dsh", "dsh_btn_rect"),
+                ("basin", "basin_btn_rect"),
                 ("deepseek", "deepseek_btn_rect"),
                 ("scroll-up", "chat_scroll_up_rect"),
                 ("scroll-down", "chat_scroll_down_rect"),
@@ -5415,6 +5535,9 @@ class PetHost:
                     else:
                         log("用户点击：拒绝本次权限申请")
                         watcher.answer_async("rejected")
+                elif action == "basin":
+                    log("按钮：扣铁盆")
+                    self.post({"t": "basin-drop"})
                 elif action == "dsh":
                     log("按钮：切到 DeepSeek Harness 网页版")
                     self.open_agent_page("dsh")
@@ -5629,7 +5752,9 @@ class PetHost:
             self.toggle_chat_edge_window()
             return
         # DSH 页：复用 open_dsh 那套（它会优先找 DSH 页，没有才退回聊天页）
-        if not self.dsh_web_running(port):
+        # 用非阻塞的缓存值：同步探测会把界面线程钉住 350ms（鼠标发涩）。
+        # 判断错了也没关系 —— open_dsh 在后台线程里还会再权威地探一次。
+        if not self.dsh_web_ready_cached():
             log("DSH 服务没在跑，先启动它")
             self.open_dsh()
             return
