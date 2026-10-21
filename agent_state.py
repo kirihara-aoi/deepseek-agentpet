@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import glob
 import json
 import os
@@ -428,17 +429,7 @@ def _newest_file(patterns) -> tuple[str | None, float]:
 def _newest_file_uncached(patterns) -> tuple[str | None, float]:
     path, newest = None, 0.0
     for pattern in patterns or []:
-        try:
-            matches = glob.glob(pattern, recursive=True)
-        except (OSError, re.error):
-            continue
-        for item in matches:
-            try:
-                if not os.path.isfile(item):
-                    continue
-                mtime = os.path.getmtime(item)
-            except OSError:
-                continue
+        for item, mtime in _scan_files(pattern):
             if mtime > newest:
                 path, newest = item, mtime
     return path, newest
@@ -1550,6 +1541,119 @@ def _dsh_is_running(path: str) -> bool:
     )
 
 
+# 单个会话文件的解析结果缓存：path -> (mtime, is_running)。
+# mtime 没变就说明内容没变，结果必然相同 —— 不必重复 json.load（很贵，还占 GIL）。
+_RUNNING_FILE_CACHE: dict[str, tuple[float, bool]] = {}
+
+# 递归 glob（**）的结果缓存：pattern -> (取结果的时刻, [路径])。
+# 平铺模式不缓存（很便宜，且要保证新会话能被立刻发现）。
+_GLOB_CACHE: dict[str, tuple[float, list]] = {}
+_GLOB_DEEP_TTL = 10.0
+
+
+def _dsh_is_running_cached(path: str, mtime: float) -> bool:
+    hit = _RUNNING_FILE_CACHE.get(path)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    value = _dsh_is_running(path)
+    if len(_RUNNING_FILE_CACHE) > 800:
+        _RUNNING_FILE_CACHE.clear()
+    _RUNNING_FILE_CACHE[path] = (mtime, value)
+    return value
+
+
+def _looks_json_pattern(pattern: str) -> bool:
+    """这个 glob 模式的"文件名部分"是否以 .json 结尾。
+
+    _dsh_is_running 只能解析 JSON，所以 *.jsonl.zstd 这类模式对它毫无意义；
+    sessions/* 是个超集（和显式的 *.json 重复），也可以跳过。
+    """
+    tail = pattern.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return tail.endswith(".json")
+
+
+def _glob_matches(pattern: str) -> list:
+    """带缓存的 glob：只有含 ** 的深递归模式才缓存（它们动辄几毫秒）。"""
+    deep = "**" in pattern
+    if deep:
+        hit = _GLOB_CACHE.get(pattern)
+        now = _now()
+        if hit is not None and now - hit[0] < _GLOB_DEEP_TTL:
+            return hit[1]
+    try:
+        matches = glob.glob(pattern, recursive=True)
+    except (OSError, re.error):
+        return []
+    if deep:
+        if len(_GLOB_CACHE) > 64:
+            _GLOB_CACHE.clear()
+        _GLOB_CACHE[pattern] = (_now(), matches)
+    return matches
+
+
+def _scan_flat(dirname: str, mask: str) -> list:
+    """单层目录扫描：[(路径, mtime)]，语义对齐 glob.glob(dirname + os.sep + mask)。
+
+    用 os.scandir 而不是 glob：目录枚举时就带回了 mtime，
+    不需要再对每个文件单独 os.path.getmtime（几百个会话时这就是主要开销）。
+    隐藏文件规则、大小写不敏感（Windows）都跟 glob 保持一致。
+    """
+    out: list = []
+    allow_hidden = mask.startswith(".")
+    try:
+        it = os.scandir(dirname)
+    except OSError:
+        return out
+    try:
+        for entry in it:
+            name = entry.name
+            if not allow_hidden and name.startswith("."):
+                continue
+            if not fnmatch.fnmatch(name, mask):
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            out.append((os.path.join(dirname, name), mtime))
+    except OSError:
+        pass
+    finally:
+        it.close()
+    # glob 每个目录内是按名字排序输出的；排一下，
+    # 让 mtime 相同的文件在后续 "取最新" 时胜出者与优化前完全一致。
+    out.sort(key=lambda pair: pair[0])
+    return out
+
+
+def _scan_files(pattern: str) -> list:
+    """列出一个 glob 模式命中的文件 [(路径, mtime)]。
+
+    平铺模式（只有最后一段带通配符）走 _scan_flat；含 ** 或目录段带通配符的
+    交给 glob（深递归模式另有 10 秒结果缓存）。
+    """
+    norm = pattern.replace("\\", "/")
+    dirname, _, mask = norm.rpartition("/")
+    flat = bool(dirname) and bool(mask) and "**" not in pattern
+    if flat:
+        try:
+            flat = not glob.has_magic(dirname)
+        except re.error:
+            flat = False
+    if not flat:
+        out = []
+        for item in _glob_matches(pattern):
+            try:
+                if os.path.isfile(item):
+                    out.append((item, os.path.getmtime(item)))
+            except OSError:
+                continue
+        return out
+    return _scan_flat(dirname.replace("/", os.sep), mask)
+
+
 def _running_session_file(patterns) -> tuple[str | None, float]:
     """在 dsh 会话里挑一个「正在运行」的（优先）；没有就返回 (None, 0)。
 
@@ -1561,24 +1665,24 @@ def _running_session_file(patterns) -> tuple[str | None, float]:
     if hit and now - hit[0] < NEWEST_CACHE_TTL:
         return hit[1], hit[2]
 
+    # A. 只 glob 能被 _dsh_is_running 解析的模式（.json）。
+    #    没有 .json 模式时退回全部（保持原有行为，不改变结果）。
+    all_patterns = list(patterns or [])
+    json_patterns = [p for p in all_patterns if _looks_json_pattern(p)]
     files = []
-    for pattern in patterns or []:
-        try:
-            matches = glob.glob(pattern, recursive=True)
-        except (OSError, re.error):
-            continue
-        for item in matches:
-            try:
-                if os.path.isfile(item):
-                    files.append((os.path.getmtime(item), item))
-            except OSError:
-                continue
+    for pattern in (json_patterns or all_patterns):
+        files.extend((mt, item) for item, mt in _scan_files(pattern))
     # 从新到旧：同时找"正在跑"的和"刚完成"的
     files.sort(key=lambda pair: pair[0], reverse=True)
     running_path, running_mtime = None, 0.0
     done_path, done_mtime = None, 0.0
     for mt, item in files:
-        if _dsh_is_running(item):
+        # B. 已按 mtime 降序排列：一旦超过 STALE_RUNNING_SECONDS，
+        #    后面只会更旧 —— 既不可能"运行中"（180s 门槛），
+        #    更不可能"刚完成"（6s 门槛），直接收工。
+        if (now - mt) >= STALE_RUNNING_SECONDS:
+            break
+        if _dsh_is_running_cached(item, mt):
             # 只有"最近还在写文件"的运行中会话才认；很久没动的僵尸会话跳过
             if running_path is None and (now - mt) < STALE_RUNNING_SECONDS:
                 running_path, running_mtime = item, mt

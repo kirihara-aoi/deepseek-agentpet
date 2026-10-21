@@ -92,6 +92,9 @@ DEFAULTS = {
     "cardStyle": "glass",    # "glass" = 最初版的半透明+模糊浮层；"solid" = 简洁实色卡片
     "cardGap": 12.0,         # 进度卡片与角色头顶的间距（CSS 像素）
     "cardScaleWithPet": True,# 卡片字号/内边距是否跟着桌宠一起缩放
+    "soundEnabled": True,    # 扣盆落地那一声（右键菜单可关）
+    "soundPokeBasin": True,  # 盆扣在头上时戳头：敲盆（右键菜单可关）
+    "soundPokeBody": True,   # 一般戳头：冒泡（右键菜单可关）
     "verboseLog": False,     # 是否把鼠标事件也写进日志（排查用，默认关）
     "bottomButtonsMode": "assistant",  # "assistant" = 桌宠工具；"codex" = Codex 联动
     "bottomTrigger": DEFAULT_BOTTOM_TRIGGER,  # 三个图标的触发方式（见上面注释）
@@ -168,6 +171,9 @@ def save(data: dict) -> dict:
     clean["motionGapSeconds"] = max(0.0, min(120.0, float(clean["motionGapSeconds"])))
     clean["cardGap"] = max(-20.0, min(60.0, float(clean["cardGap"])))
     clean["cardScaleWithPet"] = bool(clean["cardScaleWithPet"])
+    clean["soundEnabled"] = bool(clean.get("soundEnabled", True))
+    clean["soundPokeBasin"] = bool(clean.get("soundPokeBasin", True))
+    clean["soundPokeBody"] = bool(clean.get("soundPokeBody", True))
     clean["verboseLog"] = bool(clean["verboseLog"])
     if not isinstance(clean.get("motionAllowed"), list):
         clean["motionAllowed"] = []

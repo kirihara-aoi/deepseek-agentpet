@@ -342,6 +342,7 @@ function countFrame() {
 
 function applySettings(cfg) {
   state.settings = cfg || {};
+  ensureSfx();               // 页面一就绪就把三个音效都解码好，点下去不用等加载
   applyFpsLimit();
   refreshPlaybackPolicy();
   const style = (cfg && cfg.cardStyle) === "solid" ? "style-solid" : "style-glass";
@@ -1351,6 +1352,13 @@ const BASIN_POKE_LINES = [
   { text: "这算工伤吧…", w: 1.1 },        // 她本来就在"写作业"，死鱼眼式吐槽
   { text: "人家头都被敲出回音了", w: 1.0 },
   { text: "本子上的字全歪了", w: 0.9 },   // 呼应她低头拿笔的姿势
+  // —— 再补五句：仍然按"人家 + 小声抱怨 + 一点吃货梗"的调性，
+  //    每句各挂一个梗，避免和上面十句撞意思 ——
+  { text: "当当响…我成乐器了", w: 1.15 },      // 拟声自嘲，和"敲出回音"同族但不重复
+  { text: "盆底写着“再来一下”是吧", w: 1.05 }, // 吐槽用户一直戳（点一次就续 1800ms）
+  { text: "饭还没吃就先扣盆", w: 1.0 },         // 吃货线，接"别扣饭钱""不要压力鱼"
+  { text: "人家想申请个头盔…", w: 1.0 },       // 接"这算工伤吧"的职场线
+  { text: "铁头功是这么练的吗", w: 0.9 },       // 死鱼眼吐槽
 ];
 
 /** 按权重抽一句，尽量不和上一次重复。 */
@@ -1365,6 +1373,257 @@ function pickBasinLine() {
     if (r <= 0) return it.text;
   }
   return pool[pool.length - 1].text;
+}
+
+/* ------------------------------------------------------------ 音效 */
+/*
+  三个音效，各管一处，各有各的开关（都随 settings 下发）：
+
+    名字        素材                                    触发点                     设置键
+    drop        钢管落地（爱给网，2.847s）              盆**落地那一下**           soundEnabled
+    basinPoke   敲盆（1.400s）                         盆扣在头上时单击戳头       soundPokeBasin
+    bubble      冒泡（爱给网，0.34s）                   一般戳头（盆没扣着）       soundPokeBody
+
+  落地声和"咣当"文字同一时刻，不是按按钮的瞬间 —— 盆要掉 0.4 秒，先响会音画不同步。
+
+  **为什么用 Web Audio 而不是 <audio> 元素**（连点间隔的坑就在这）：
+  最初是 `el.pause(); el.currentTime = 0; el.play()` 复用同一个元素。Chromium 里
+  这套在"上一次还没放完"的时候不可靠 —— seek 会被并掉、play() 有时直接不生效，
+  于是连点时第二声要等上一声放完才响，听感就是"间隔特别长"。
+  AudioBufferSourceNode 每次都是新建一个声源直接 start(0)，没有 seek、没有
+  重新建音频管道，延迟在毫秒级；同一个音效的上一个声源显式 stop 掉，不会叠成噪音。
+  （不同音效之间允许重叠：盆还在"咣当"，戳一下头也该有冒泡声。）
+*/
+const SFX_SRC = {
+  drop: "basin-sfx.mp3",
+  basinPoke: "basin-poke.m4a",
+  bubble: "poke-bubble.mp3",
+};
+const SFX_SETTING = {
+  drop: "soundEnabled",
+  basinPoke: "soundPokeBasin",
+  bubble: "soundPokeBody",
+};
+const SFX_LABEL = { drop: "扣盆", basinPoke: "敲盆", bubble: "冒泡" };
+
+const sfx = {
+  ctx: null,          // 三个音效共用一个 AudioContext
+  ctxFailed: false,
+  sounds: Object.create(null),
+  warm: null,         // 一直挂着的静音循环源：不让音频输出流睡过去
+  latencySent: false, // 音频输出延迟只报一次
+};
+
+/** 取（必要时建）某个音效自己的状态：buffer / 缓存 / 兜底元素 / 上一个声源。 */
+function sfxState(name) {
+  let s = sfx.sounds[name];
+  if (!s) {
+    s = { buf: null, loading: false, failed: false, last: null, el: null };
+    sfx.sounds[name] = s;
+  }
+  return s;
+}
+
+/** 这个音效的开关（宿主没下发过就当开）。 */
+function sfxAllowed(name) {
+  const cfg = state.settings || {};
+  const key = SFX_SETTING[name];
+  return !key || cfg[key] !== false;
+}
+
+function ensureSfxContext() {
+  if (sfx.ctx || sfx.ctxFailed) return sfx.ctx;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) {
+      sfx.ctxFailed = true;
+      return null;
+    }
+    // latencyHint: "interactive" = 让 Chromium 选最小缓冲（本来就是默认值，写出来免得以后被改）
+    sfx.ctx = new Ctx({ latencyHint: "interactive" });
+    // 启动参数里有 --autoplay-policy=no-user-gesture-required，正常建出来就是 running；
+    // 万一被挂起，顺手唤醒一下（失败也不要紧，真点的时候还会再试）。
+    if (sfx.ctx.state === "suspended") {
+      const p = sfx.ctx.resume();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    }
+  } catch (err) {
+    sfx.ctxFailed = true;
+    sfx.ctx = null;
+  }
+  return sfx.ctx;
+}
+
+function decodeSfx(name) {
+  const s = sfxState(name);
+  if (s.buf || s.loading || s.failed) return;
+  const ctx = ensureSfxContext();
+  if (!ctx) return;
+  s.loading = true;
+  fetch(SFX_SRC[name])
+    .then((resp) => resp.arrayBuffer())
+    .then((data) => ctx.decodeAudioData(data))
+    .then((buf) => {
+      s.buf = buf;
+      s.loading = false;
+      // 量两件事：
+      //  · 开头静音 = "点了之后干等着"的那几百毫秒 → 播放时直接从有声音的地方开始；
+      //  · 峰值 → 给音量加上限，调大音量也不会削顶破音。
+      const m = measureSfx(buf);
+      s.lead = m.lead;
+      s.peak = m.peak;
+      // 给宿主报一条：确认解码成功、时长对得上（排查"没声音"时一眼能看出来）
+      try {
+        const info = {
+          t: "sfx-ready",
+          name: SFX_LABEL[name] || name,
+          seconds: Math.round((buf.duration || 0) * 100) / 100,
+          leadMs: Math.round((s.lead || 0) * 1000),
+          peak: Math.round((s.peak || 0) * 100) / 100,
+        };
+        // 只报一次音频输出延迟：这是"点了到响"的硬下限，查延迟先看这个数
+        if (!sfx.latencySent) {
+          sfx.latencySent = true;
+          info.latency = Math.round((ctx.outputLatency || ctx.baseLatency || 0) * 1000);
+        }
+        bridge.send(info);
+      } catch (err) {
+        /* 诊断用，发不出去不影响播放 */
+      }
+    })
+    .catch((err) => {
+      s.loading = false;
+      s.failed = true;
+      console.warn("[sfx] 解码失败（" + name + "），退回 <audio> 播放：" + err);
+      try {
+        bridge.send({ t: "error", message: "音效解码失败（" + (SFX_LABEL[name] || name) + "）：" + err });
+      } catch (e) {
+        /* 忽略 */
+      }
+    });
+}
+
+/** 页面一就绪就调：建好 AudioContext 并把三个音效全部解码，点的时候就不用等。 */
+/** 量一个解码好的音频：开头静音多少秒、峰值多少。 */
+function measureSfx(buf) {
+  const out = { lead: 0, peak: 0 };
+  try {
+    const rate = buf.sampleRate || 44100;
+    const threshold = 0.02;          // 约 -34 dBFS，低于它当静音
+    let first = -1;
+    let peak = 0;
+    for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+      const data = buf.getChannelData(ch);
+      for (let i = 0; i < data.length; i++) {
+        const v = data[i] < 0 ? -data[i] : data[i];
+        if (v > peak) peak = v;
+        if (ch === 0 && first < 0 && v > threshold) first = i;
+      }
+    }
+    // 上限 0.8 秒：够覆盖这类"录进来带一段空白"的素材，又不至于把前奏整个吞掉
+    out.lead = first > 0 ? Math.min(first / rate, 0.8) : 0;
+    out.peak = peak;
+  } catch (err) {
+    /* 量不出来就用默认值（不砍、不钳） */
+  }
+  return out;
+}
+
+function ensureSfx() {
+  ensureSfxContext();
+  warmSfxStream();
+  for (const name of Object.keys(SFX_SRC)) decodeSfx(name);
+}
+
+/**
+ * 让音频输出流一直活着 —— 这是"点了到响"那段延迟的主要来源。
+ *
+ * Chromium 在没有声源播放时会把音频输出流挂起；下一次 start() 得先重开设备、
+ * 攒够缓冲才出声，实测这一下能拖几十甚至上百毫秒，表现就是"画面已经弹了、
+ * 声音跟在后面"。这里常驻一个**全零的循环缓冲**（音量压到 0.0001），
+ * 输出流不会睡，真要响的时候就是"立刻 start"。
+ */
+function warmSfxStream() {
+  const ctx = sfx.ctx;
+  if (!ctx || sfx.warm) return;
+  try {
+    const frames = Math.max(1, Math.floor(ctx.sampleRate * 0.25));
+    const src = ctx.createBufferSource();
+    src.buffer = ctx.createBuffer(1, frames, ctx.sampleRate);   // 全 0 = 静音
+    src.loop = true;
+    const gain = ctx.createGain();
+    gain.gain.value = 0.0001;      // 别正好给 0：太"安静"时有的路径仍会判成无声
+    src.connect(gain);
+    gain.connect(ctx.destination);
+    src.start(0);
+    sfx.warm = src;
+  } catch (err) {
+    /* 暖流失败不影响正常播放 */
+  }
+}
+
+/**
+ * 放一次音效。volume 可选。每次调用都立刻发声，并掐掉**同一个音效**的上一次 ——
+ * 连点手感要的是"每下都有回应"，不是等上一声放完。
+ */
+function playSfx(name, volume) {
+  if (!sfxAllowed(name)) return;
+  const vol = Math.max(0, Math.min(1, volume === undefined ? 1 : volume));
+  const s = sfxState(name);
+  const ctx = ensureSfxContext();
+  if (ctx && s.buf) {
+    try {
+      if (ctx.state === "suspended") {
+        const rp = ctx.resume();
+        if (rp && typeof rp.catch === "function") rp.catch(() => {});
+      }
+      if (s.last) {
+        try {
+          s.last.stop();
+        } catch (err) {
+          /* 已经自然播完的声源再 stop 会抛，忽略 */
+        }
+        s.last = null;
+      }
+      const src = ctx.createBufferSource();
+      src.buffer = s.buf;
+      const gain = ctx.createGain();
+      // 峰值钳制：calibrated 的音量再大也不越过 0.99，避免削顶
+      const peak = s.peak || 1;
+      gain.gain.value = peak > 0 ? Math.min(vol, 0.99 / peak) : vol;
+      src.connect(gain);
+      gain.connect(ctx.destination);
+      // 跳过文件开头的静音：这才是"点了到响"之间最直观的那一段
+      const offset = s.lead > 0 && s.lead < Math.max(0, s.buf.duration - 0.05) ? s.lead : 0;
+      if (offset > 0) src.start(0, offset);
+      else src.start(0);
+      s.last = src;
+      return;
+    } catch (err) {
+      /* 掉到下面的 <audio> 兜底 */
+    }
+  }
+  playSfxElement(name, vol);
+}
+
+/** 兜底：Web Audio 不可用（或还没解码完）时，用最朴素的 <audio> 元素放一次。 */
+function playSfxElement(name, volume) {
+  try {
+    const s = sfxState(name);
+    if (!s.el) {
+      const el = new Audio(SFX_SRC[name]);
+      el.preload = "auto";
+      s.el = el;
+    }
+    const el = s.el;
+    el.pause();
+    el.currentTime = 0;
+    el.volume = volume;
+    const p = el.play();
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  } catch (err) {
+    /* 没有声卡 / 系统禁用了音频：静默忽略，动画照旧 */
+  }
 }
 
 const basin = {
@@ -1551,9 +1810,10 @@ function basinDrop() {
 /** 盆在头上时被单击：不换表情、延长扣着时间、说句话、模型弹一下。 */
 function basinPoke() {
   if (basin.phase === "landed") {
-    // 重置等待期（不是累加）：连点能一直顶着，但松手 0.5 秒后就飞走，
+    // 重置等待期（不是累加）：连点能一直顶着，但松手 1.8 秒（BASIN_HOLD_MS）后就飞走，
     // 不会像之前那样"点十下就扣十几秒"。
     basin.landedAt = performance.now();
+    playSfx("basinPoke", 1.3);               // 敲盆：盆已经扣在头上了才有这一声（调大）
   }
   const line = pickBasinLine();
   basin.lastLine = line;
@@ -1579,6 +1839,7 @@ function basinTick() {
       basin.landedAt = now;
       bounceModel(1.2);                  // 扣上瞬间：**只有模型弹跳**（盆跟着模型走）
       toast("咣当");                     // 反应文字
+      playSfx("drop", 1.0);              // 落盆声：和"咣当"同一时刻
     }
     sp.x = a.cx;
     sp.y = basin.y;
@@ -1964,7 +2225,6 @@ const approval = {
   // 权限卡片弹出时把任务卡片临时收起（两者都会占用模型上方那条带子，必然重叠），
   // 处理完（通过 / 驳回 / ✕）再把它恢复回来。
   cardWasOpen: false,
-  chatWasShown: false,
 };
 
 /** 显示（或更新）权限申请。内容没变就只保证可见，不碰 DOM。 */
@@ -1980,9 +2240,21 @@ function approvalShow(pending) {
   // 权限卡片优先级最高：先把它会重叠的东西收起来（记下来，处理完再恢复）
   if (first) {
     approval.cardWasOpen = Boolean(state.cardOpen);
-    approval.chatWasShown = Boolean(chat.shown);
+    // 注意顺序：setCardOpen(false) 自己也可能把"之前因开卡片而收起的气泡"放回来，
+    // 所以先关卡片，再看气泡当前到底显示没显示。
     if (state.cardOpen) setCardOpen(false);
-    if (chat.shown) chatHide();
+
+    if (chat.shown) {
+      // **先把内容存进 chat.suspended 再 hide**：chatHide() 200ms 后会把 DOM 文本清掉，
+      // 不存的话这条回复就彻底丢了（原来的 bug 就在这里，权限关掉后气泡再也回不来）。
+      chat.suspended = {
+        text: chat.target,
+        name: ui.chatBubbleName ? ui.chatBubbleName.textContent : "",
+        foot: ui.chatBubbleFoot ? ui.chatBubbleFoot.textContent : "",
+        streaming: Boolean(chat.streaming),
+      };
+      chatHide();
+    }
   }
 
   approval.open = true;
@@ -2034,19 +2306,22 @@ function approvalHide() {
       }
     }, 170);
     // 权限处理完了（通过 / 驳回 / ✕）：把刚才让位的东西恢复回来。
-    // 任务卡片优先（它是用户主动在看的），否则恢复被收起的回复气泡。
-    if (approval.cardWasOpen) {
+    // **气泡优先**：用户要求"权限一结束，回复就自己回来"；只有完全没有气泡可恢复时
+    // 才去恢复任务卡片（两者互斥，同时出现会盖住模型）。
+    const saved = chat.suspended;
+    if (saved) {
       approval.cardWasOpen = false;
-      approval.chatWasShown = false;
+      chat.suspended = null;
+      chatShow(saved.text, {
+        name: saved.name,
+        foot: saved.foot,
+        streaming: Boolean(saved.streaming),
+        keepSuspended: true,
+      });
+      chatRenderFull();
+    } else if (approval.cardWasOpen) {
+      approval.cardWasOpen = false;
       setCardOpen(true);
-    } else if (approval.chatWasShown) {
-      approval.chatWasShown = false;
-      if (chat.suspended) {
-        const saved = chat.suspended;
-        chat.suspended = null;
-        chatShow(saved.text, { name: saved.name, foot: saved.foot, keepSuspended: true });
-        chatRenderFull();
-      }
     }
   }
 }
@@ -2467,6 +2742,28 @@ function chatPosition() {
 function chatShow(text, opts) {
   const o = opts || {};
   if (!ui.chatBubble) return;
+  // 权限卡片开着时**不显示气泡**，只把内容记下来（approvalHide 里统一放出来）。
+  // 必须挡在这里：回复是流式增量来的，每来一段都会调一次 chatShow —— 不挡的话
+  // 气泡会一次次盖到权限卡片上（用户反馈的"回复把权限申请顶掉"就是这个）。
+  if (approval.open) {
+    chat.target = String(text == null ? "" : text);
+    chat.streaming = Boolean(o.streaming);
+    chat.hideAt = 0;                       // 延后显示时旧的到期时间已经无意义
+    if (o.restart) {
+      chat.typed = 0;
+      chat.userScrolled = false;
+    }
+    if (o.name && ui.chatBubbleName) ui.chatBubbleName.textContent = o.name;
+    if (ui.chatBubbleFoot) ui.chatBubbleFoot.textContent = o.foot || "";
+    chat.suspended = {
+      text: chat.target,
+      name: ui.chatBubbleName ? ui.chatBubbleName.textContent : "",
+      foot: ui.chatBubbleFoot ? ui.chatBubbleFoot.textContent : "",
+      streaming: Boolean(o.streaming),
+    };
+    chat.shown = false;
+    return;
+  }
   // 卡片和气泡互斥：纵向只有一条带子（模型上方 ~174px），两者同时出现必然重叠、
   // 盖住模型。回复比"进度快照"更重要，所以显示回复时先收起卡片。
   if (state.cardOpen) {
@@ -2924,6 +3221,8 @@ function pokeReact() {
     basinPoke();
     return;
   }
+  // 一般戳头（盆没扣着）：冒泡声。放在最前面，这样"干活时被戳""喷水"那些分支也都有声。
+  playSfx("bubble", 0.7);
   const now = performance.now();
   const key = state.key || "idle";
   const busy = key !== "idle" && key !== "done";

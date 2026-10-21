@@ -97,6 +97,14 @@ TOOL_MARK_HALF_X = 0.046
 # 高出快一倍 —— 点在图标上方一截空白也会被算成按到按钮，就是这么来的。
 TOOL_MARK_HALF_Y_UP = 0.032
 TOOL_MARK_HALF_Y_DOWN = 0.045
+# 右键菜单里的三个音效开关（键 = pet_settings.json 里存的设置名）
+SOUND_MENU_ORDER = ("soundEnabled", "soundPokeBasin", "soundPokeBody")
+SOUND_MENU_LABELS = {
+    "soundEnabled": "扣盆（落地那一声）",
+    "soundPokeBasin": "敲盆（盆扣着时戳头）",
+    "soundPokeBody": "冒泡（一般戳头）",
+}
+
 TOOL_LABELS = {
     "undo": "↩️ 撤回",
     "pencil": "📝 铅笔",
@@ -284,7 +292,9 @@ CURSOR_SEND_INTERVAL = 0.066
 #
 # 注意**不能**把 pet-btn-press / chat / render 这类一次性的放进来：它们丢了就真丢了
 # （按下反馈、回复气泡、暂停指令）。
-COALESCE_TYPES = frozenset({"cursor", "react", "state", "fps", "say", "tick"})
+# 注意我**故意把 react 摘出去了**：react 是"点了一下"这种离散事件（poke/drag/drop），
+# 不是"整体快照"。放进来会被合并成一条，表现为连点时有些点击根本没反应。
+COALESCE_TYPES = frozenset({"cursor", "state", "fps", "say", "tick"})
 COALESCE_BY_KEY = {"pet-btn-hot": "which"}
 
 
@@ -1699,6 +1709,16 @@ class PetHost:
             )
         elif kind == "error":
             log("页面报错：%s" % msg.get("message"))
+        elif kind == "sfx-ready":
+            bits = []
+            if msg.get("peak") is not None:
+                bits.append("峰值 %s" % msg.get("peak"))
+            if msg.get("leadMs"):
+                bits.append("开头静音 %s ms（已跳过）" % msg.get("leadMs"))
+            if msg.get("latency"):
+                bits.append("输出延迟 %s ms" % msg.get("latency"))
+            extra = "（%s）" % "，".join(bits) if bits else ""
+            log("音效已就绪：%s %s 秒%s" % (msg.get("name") or "?", msg.get("seconds"), extra))
         elif kind == "card-state":
             # 页面可能自己收起过卡片（比如来了回复气泡）：同步宿主的标记，
             # 否则 inline_card_open 会一直为 True，"任务完成自动弹卡片"就再也不触发了。
@@ -3268,6 +3288,40 @@ class PetHost:
             return
         self.invoke_on_card(lambda: self.update_card(payload))
 
+    def toggle_sound(self, key: str) -> None:
+        """右键菜单里的音效开关：扣盆落地 / 敲盆（盆扣着时戳）/ 冒泡（一般戳头）。"""
+        items = getattr(self, "_sound_menu_items", None) or {}
+        item = items.get(key)
+        if item is not None:
+            on = bool(item.Checked)          # CheckOnClick 已经翻过了
+        else:
+            on = not bool((self.settings or {}).get(key, True))
+        self.settings[key] = on
+        try:
+            self.settings = settings_store.save(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            log("保存音效开关失败：%r" % (exc,))
+        log("音效：%s %s" % ("开" if on else "关", SOUND_MENU_LABELS.get(key, key)))
+        self.push_settings()
+
+    def _make_sound_item(self, key: str):
+        """做一个勾选式的音效菜单项（CheckOnClick：点完 Checked 就是新状态）。"""
+        from System.Windows.Forms import ToolStripMenuItem
+
+        item = ToolStripMenuItem("音效 · %s" % SOUND_MENU_LABELS[key])
+        item.CheckOnClick = True
+        item.Checked = bool((self.settings or {}).get(key, True))
+
+        def on_click(sender, args, k=key):
+            self._menu_close_reason = "点选了菜单项"
+            self.toggle_sound(k)
+
+        item.Click += on_click
+        if not isinstance(getattr(self, "_sound_menu_items", None), dict):
+            self._sound_menu_items = {}
+        self._sound_menu_items[key] = item
+        return item
+
     def show_menu(self, screen_x: int, screen_y: int) -> None:
         from System.Windows.Forms import ContextMenuStrip, ToolStripSeparator, ToolStripMenuItem
 
@@ -3278,6 +3332,7 @@ class PetHost:
                 ("刷新卡片信息", self.refresh_card_now),
                 ("换个表情", lambda: self.post({"t": "cycle-expression"})),
                 ("随机动作", lambda: self.post({"t": "react", "kind": "motion"})),
+                ("__sound__", None),          # 音效三个开关插在这里
                 ("-", None),
                 ("设置…", self.show_settings),
                 ("和 DeepSeek 说话（chat.deepseek.com）", self.toggle_chat_window),
@@ -3293,6 +3348,10 @@ class PetHost:
             for label, handler in items:
                 if label == "-":
                     menu.Items.Add(ToolStripSeparator())
+                    continue
+                if label == "__sound__":
+                    for sound_key in SOUND_MENU_ORDER:
+                        menu.Items.Add(self._make_sound_item(sound_key))
                     continue
                 item = ToolStripMenuItem(label)
 
@@ -3323,6 +3382,9 @@ class PetHost:
                 item_text = str(getattr(item, "Text", "") or "")
                 if item_text.startswith("切到 ") and item_text.endswith("窗口"):
                     item.Text = label
+            # 音效开关：每次弹菜单都按当前设置刷一遍勾，别和真实状态对不上
+            for key, item in (getattr(self, "_sound_menu_items", None) or {}).items():
+                item.Checked = bool((self.settings or {}).get(key, True))
         except Exception:  # noqa: BLE001
             pass
         self.menu.Show(self.Point(screen_x, screen_y))
@@ -5013,9 +5075,12 @@ class PetHost:
         if not win or win is False:
             return
         try:
-            self._chat_win_was_visible = bool(win.form is not None and win.form.Visible)
+            # 只读缓存、只投递：窗口是另一个线程的，这里不碰它的 WinForms 属性
+            # 用"期望可见 或 实际可见"：刚按下说话、窗口线程还没建完时 is_visible() 仍是 False，
+            # 只认它就会漏收，结果让位后输入框还浮在 DSH 页面上。
+            self._chat_win_was_visible = bool(win.wants_visible() or win.is_visible())
             if self._chat_win_was_visible:
-                win.form.Hide()
+                win.hide()
         except Exception as exc:  # noqa: BLE001
             log("收起聊天输入框失败：%r" % (exc,))
 
@@ -5026,9 +5091,7 @@ class PetHost:
             return
         try:
             self._chat_win_was_visible = False
-            if win.form is not None and not win.form.Visible:
-                win.form.Show()
-                win.form.Activate()
+            win.show()
         except Exception as exc:  # noqa: BLE001
             log("恢复聊天输入框失败：%r" % (exc,))
 
@@ -5118,15 +5181,9 @@ class PetHost:
                 out.append(card)
         except Exception:  # noqa: BLE001
             pass
-        try:
-            chat = getattr(self, "_chat_window", None)
-            if chat is not None and chat is not False:
-                # _chat_window 是包装对象（里面才是 Form），也可能直接是 None/False
-                form = getattr(chat, "form", None)
-                if form is not None:
-                    out.append(form)
-        except Exception:  # noqa: BLE001
-            pass
+        # 聊天输入框**不放进这个列表**：它活在自己的线程上，跨线程读写
+        # Visible/TopMost/BringToFront/Handle 会让两边互等（Handle 更危险：
+        # 句柄没建时会在错线程上 CreateHandle）。它的置顶复查由调用方单独触发。
         return out
 
     def _reassert_aux_topmost(self) -> None:
@@ -5145,6 +5202,13 @@ class PetHost:
         if not isinstance(stamps, dict):
             stamps = {}
             self._aux_force_at = stamps
+        # 聊天输入框：让它在自己的窗口线程里复查置顶（内部 2 秒节流）。
+        try:
+            chat = getattr(self, "_chat_window", None)
+            if chat is not None and chat is not False:
+                chat.reassert_topmost()
+        except Exception:  # noqa: BLE001
+            pass
         for form in self.aux_windows():
             try:
                 if not bool(form.Visible):
@@ -5210,7 +5274,7 @@ class PetHost:
             if getattr(self, "notice_rect", None):
                 return True                      # 常驻提示正在显示
             win = getattr(self, "_chat_window", None)
-            if win is not None and bool(getattr(win, "Visible", False)):
+            if win is not None and win is not False and bool(win.is_visible()):
                 return True                      # 聊天输入框开着
         except Exception:  # noqa: BLE001
             pass
@@ -5830,6 +5894,7 @@ class PetHost:
                     dpi_scale=float(self.dpi_scale or 1.0),
                     on_close=self.on_chat_window_closed,
                     host_invoke=self.invoke_on_pet,
+                    on_log=log,
                 )
             except Exception as exc:  # noqa: BLE001
                 log("创建聊天输入窗口失败：%r" % (exc,))
@@ -5873,19 +5938,13 @@ class PetHost:
         except Exception:  # noqa: BLE001
             bubble = None
         try:
+            # toggle 现在只是"翻转意图 + 投递"，立刻返回：
+            # 窗口线程自己负责创建、定位（模型左边）、显示、置顶。
+            # 这里**绝不**再读写 win.form 的任何属性 —— 跨线程碰 WinForms
+            # 会让两边互相等（之前就是它把界面线程钉住、报"未响应"）。
             win.toggle(rect, bubble)
-            visible = bool(win.form is not None and win.form.Visible)
-            if visible and win.form is not None:
-                # **弹出那一刻就置顶**。只靠 tick 里的对账（每 110ms）的话，
-                # 第一下按下去到下一次 tick 之间，窗口可能已经被前台的窗口盖住了
-                # ——用户反馈"VS Code 下第一次按 DS 看不到输入框"就是这个窗口期。
-                try:
-                    win.form.TopMost = True
-                    win.form.BringToFront()
-                    self._force_topmost(win.form)
-                except Exception:  # noqa: BLE001
-                    pass
-            log("聊天输入框：%s%s" % ("收起" if not visible else "弹出", "" if rect else "（拿不到桌宠位置）"))
+            log("聊天输入框：%s%s" % ("弹出" if win.wants_visible() else "收起",
+                                    "" if rect else "（拿不到桌宠位置）"))
         except Exception as exc:  # noqa: BLE001
             log("切换聊天输入框失败：%r" % (exc,))
             return
