@@ -628,35 +628,59 @@ class MouseTracker:
     def __init__(self) -> None:
         self.left_down = False
         self.right_down = False
+        # **每个键各有一份按下记录**。原来只有一份 press_button / press_at / press_pos，
+        # 两个键交错按时会互相覆盖：先按住左键、再点一下右键，press_button 就被改成
+        # "right"；接着松开左键，_release 按 "right" 结算 —— left_down 永远清不掉。
+        # 之后 `if left and not self.left_down` 永远不成立，左键彻底失灵：
+        # 桌宠拖着拖着就不动了、怎么点都没反应（用户反馈的"死机、鼠标无法拖动"）。
+        self.press = {"left": self._blank_press(), "right": self._blank_press()}
+        # 下面这些是"当前这一次按下"的对外快照（拖动起点要用），保持和原来一致的语义
         self.press_button = ""
         self.press_at = 0.0
         self.press_pos = (0, 0)
         self.press_on_char = False
         self.moved = 0.0
         self.dragging = False
+        self.drag_button = ""
+
+    @staticmethod
+    def _blank_press() -> dict:
+        return {"held": False, "at": 0.0, "pos": (0, 0), "on_char": False, "moved": 0.0}
 
     def feed(self, x: float, y: float, left: bool, right: bool, on_char: bool, on_head: bool, now: float) -> list[str]:
         events: list[str] = []
 
         # 先算"按下之后移动了多远"：必须在松开判定之前算好，
         # 否则"按下→松开"中间没有别的 poll 时，松开那一下看到的是 0。
-        if self.press_button:
-            self.moved = max(self.moved, abs(x - self.press_pos[0]) + abs(y - self.press_pos[1]))
+        # **两个键各算各的**：只有"按在角色像素上"的那个键能起拖。
+        for name, down in (("left", self.left_down), ("right", self.right_down)):
+            if not down:
+                continue
+            rec = self.press[name]
+            far = abs(x - rec["pos"][0]) + abs(y - rec["pos"][1])
+            if far > rec["moved"]:
+                rec["moved"] = far
             # 必须在处理 release 之前把 drag-start 判出来。否则一次“按下→移动→松开”
             # 全发生在两次轮询之间时，release 看到 dragging=False，会把快速拖动误判成单击。
-            if self.press_on_char and not self.dragging and self.moved > self.DRAG_THRESHOLD:
+            if rec["on_char"] and not self.dragging and rec["moved"] > self.DRAG_THRESHOLD:
                 self.dragging = True
+                self.drag_button = name
+                self.press_button = name
+                self.press_at = rec["at"]
+                self.press_pos = rec["pos"]
+                self.press_on_char = rec["on_char"]
+                self.moved = rec["moved"]
                 events.append("drag-start")
 
         if left and not self.left_down:
             self._press("left", x, y, on_char, on_head, now)
         elif not left and self.left_down:
-            self._release(events, now, on_char)
+            self._release(events, "left", now, on_char)
 
         if right and not self.right_down:
             self._press("right", x, y, on_char, on_head, now)
         elif not right and self.right_down:
-            self._release(events, now, on_char)
+            self._release(events, "right", now, on_char)
 
         events += self.tick(now)
         return events
@@ -675,42 +699,69 @@ class MouseTracker:
             self.left_down = True
         else:
             self.right_down = True
+        rec = self.press[button]
+        rec["held"] = True
+        rec["at"] = now
+        rec["pos"] = (x, y)
+        rec["on_char"] = bool(on_char)
+        rec["moved"] = 0.0
+        # 正在拖动时，这次按下只记自己：不能把"当前按下的键"抢走，
+        # 否则拖动中碰一下右键就会把左键的拖动状态弄乱。
+        if self.dragging:
+            return
         self.press_button = button
         self.press_at = now
         self.press_pos = (x, y)
-        self.press_on_char = on_char
+        self.press_on_char = bool(on_char)
         self.moved = 0.0
-        self.dragging = False
 
-    def _release(self, events: list[str], now: float, on_char_now: bool = True) -> None:
-        """松开：一次点击要求"按下和松开都压在角色像素上"。
+    def _release(self, events: list[str], button: str, now: float, on_char_now: bool = True) -> None:
+        """松开**某一个键**：只结算这个键自己的那份按下记录。
 
-        只判按下的话，在角色边缘按下、手指挪到旁边的透明处再松手，就变成
-        "桌宠弹菜单 + 穿透出去给桌面弹菜单"同时发生（截图里那种两个菜单）。
+        一次点击要求"按下和松开都压在角色像素上"：只判按下的话，在角色边缘按下、
+        手指挪到旁边的透明处再松手，就变成"桌宠弹菜单 + 穿透出去给桌面弹菜单"
+        同时发生（截图里那种两个菜单）。
         """
-        button = self.press_button
-        dragged = self.dragging
-        quick = (now - self.press_at) < self.CLICK_MAX_SECONDS
-        # 判定规则（按下/松开两个时刻的像素结论一起看）：
-        #  * 原地点击（几乎没移动）——任一时刻判在角色上都算：按下那一瞬间的结论可能比
-        #    网页采样慢半拍，只认它的话就会出现"右键明明点在角色上却没反应"；
-        #  * 有位移（拖动级别）——要求按下和松开都在角色上，免得从别处拖进来松手也算点击。
-        if self.moved <= self.DRAG_THRESHOLD:
-            on_char = on_char_now or self.press_on_char
-        else:
-            on_char = on_char_now and self.press_on_char
-
-        self.dragging = False
-        self.press_button = ""
+        rec = self.press[button]
+        held = bool(rec["held"])
+        rec["held"] = False
+        # 先无条件清掉自己的按键标记：哪怕状态曾经错乱过，下次按下也能重新开始。
+        # （这就是"left_down 卡死之后再也拖不动"的自愈点。）
         if button == "left":
             self.left_down = False
         else:
             self.right_down = False
+        if not held:
+            return                      # 没记录到这次按下（钩子漏了一条）：什么都不做
+        if self.dragging and self.drag_button and self.drag_button != button:
+            # 另一个键正在拖：这次松手只清自己的记录，不结算（拖动中不弹菜单、也不算点击）
+            return
+
+        dragged = self.dragging
+        quick = (now - rec["at"]) < self.CLICK_MAX_SECONDS
+        # 判定规则（按下/松开两个时刻的像素结论一起看）：
+        #  * 原地点击（几乎没移动）——任一时刻判在角色上都算：按下那一瞬间的结论可能比
+        #    网页采样慢半拍，只认它的话就会出现"右键明明点在角色上却没反应"；
+        #  * 有位移（拖动级别）——要求按下和松开都在角色上，免得从别处拖进来松手也算点击。
+        if rec["moved"] <= self.DRAG_THRESHOLD:
+            on_char = on_char_now or rec["on_char"]
+        else:
+            on_char = on_char_now and rec["on_char"]
+
+        self.dragging = False
+        self.drag_button = ""
+        if self.press_button == button:
+            self.press_button = ""
 
         if dragged:
             events.append("drag-end")
             return
         if not on_char or not quick:
+            return
+        if button == "right" and self.left_down:
+            # 左键还按着：不弹菜单（等左键松开再右键）。半按状态下弹 ContextMenuStrip
+            # 会把钩子里"按下/抬起成对吞键"的状态和菜单的模态输入过滤搅在一起，
+            # 松手事件可能被吞掉 —— 用户反馈的"卡死、之后拖不动"就是它。
             return
 
         if button == "right":
@@ -2559,7 +2610,12 @@ class PetHost:
                 if wparam == WM_RBUTTONUP and self._right_swallowed:
                     self._right_swallowed = False
                     up_xy = self._cursor_xy()
-                    if up_xy and self._rs_peak <= 8:      # 没怎么动 = 一次正经右键，弹菜单
+                    # 左键还按着（典型：按住左键拖桌宠时又点了右键）就先别弹菜单。
+                    # 半按状态下把 ContextMenuStrip 弹出来，它的模态输入过滤会和钩子里
+                    # 那对"按下/抬起"的吞键状态打架，松手事件可能被吞掉 —— 表现就是
+                    # "卡死、之后鼠标拖不动"。等左键松开后再右键即可。
+                    left_held = self._left_swallowed or bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+                    if up_xy and self._rs_peak <= 8 and not left_held:   # 没怎么动 = 一次正经右键
                         self._pending_menu_at = up_xy
                     self._rs_down_at = None
                     return 1

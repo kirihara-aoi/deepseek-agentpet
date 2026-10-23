@@ -1706,10 +1706,14 @@ def _dsh_snapshot(spec: dict) -> dict:
     里面直接写了：这一轮开着没有（openTurnStartSeq / openStep / pendingCalls）、
     有没有在等用户回答（userQuestions.active）、累计 token、最后一次提问时间。
     """
-    # 优先绑定「正在运行」的会话；没有在跑的再退回"最近修改过"的那个
-    path, mtime = _running_session_file(spec.get("roots") or [])
+    # 优先绑定「正在运行」的会话；没有在跑的再退回"最近修改过"的那个。
+    # 回退**只看 JSON**：*.jsonl.zstd 是压缩过的会话日志，json.load 必然失败 → 只会得到空闲，
+    # 却可能把一份有效的最新 JSON 挡在后面，表现就是状态在"空闲 / 执行中"之间一闪一闪。
+    roots = spec.get("roots") or []
+    path, mtime = _running_session_file(roots)
     if not path:
-        path, mtime = _newest_file(spec.get("roots") or [])
+        json_roots = [p for p in roots if _looks_json_pattern(p)] or roots
+        path, mtime = _newest_file(json_roots)
     if not path:
         return _idle_payload(spec)
     try:
@@ -1752,7 +1756,17 @@ def _dsh_snapshot(spec: dict) -> dict:
     last_boundary = last_boundary if isinstance(last_boundary, dict) else {}
     open_turn = boundary.get("openTurnStartSeq")
     open_step = stats.get("openStep")
-    busy = bool(pending) or open_step is not None or open_turn is not None or str(last_boundary.get("kind") or "") == "start"
+    # **新鲜度门槛**：这个文件已经很久没被写过，说明这一轮早就收尾了（甚至 DSH 根本没开）。
+    # 那种情况下文件里残留的 openStep / openTurnStartSeq 会一直"开着"——
+    # 不看新鲜度就会把僵尸会话当成"正在执行"，于是 DSH 关着的时候桌宠一直挂着
+    # 执行中的表情、偶尔还闪一下（用户反馈的"莫名其妙换表情"）。
+    fresh = bool(mtime) and (_now() - mtime) < STALE_RUNNING_SECONDS
+    busy = fresh and (
+        bool(pending)
+        or open_step is not None
+        or open_turn is not None
+        or str(last_boundary.get("kind") or "") == "start"
+    )
 
     q_block = questions.get("questions") if isinstance(questions.get("questions"), dict) else {}
     active_questions = [item for item in (q_block.get("active") or []) if item]
@@ -1767,7 +1781,7 @@ def _dsh_snapshot(spec: dict) -> dict:
     state_hint = ""
     activity = ""
     last_role = "assistant"
-    waiting = bool(active_questions)
+    waiting = fresh and bool(active_questions)
     if busy:
         last_role = "tool"
         state_hint = "working"

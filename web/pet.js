@@ -359,6 +359,7 @@ function applySettings(cfg) {
   if (state.key) {
     state.expression = null;
     const expression = exprFor(state.key);
+
     if (expression) setExpression(expression);
     else resetExpression();
   }
@@ -367,9 +368,19 @@ function applySettings(cfg) {
 function resetExpression() {
   try {
     const mgr = model && model.internalModel && model.internalModel.motionManager;
-    if (mgr && mgr.expressionManager && typeof mgr.expressionManager.resetExpression === "function") {
-      mgr.expressionManager.resetExpression();
-    }
+    const em = mgr && mgr.expressionManager;
+    if (!em) return;
+    if (typeof em.resetExpression === "function") em.resetExpression();
+    // **库的坑（第二次扣盆不换表情的根因）**：
+    //   ExpressionManager.resetExpression() 只做 `_setExpression(defaultExpression)`
+    //   —— 把参数打回默认，**但没把 currentExpression 改回 defaultExpression**。
+    //   而 setExpression() 开头就是
+    //     `if (t === this.expressions.indexOf(this.currentExpression)) return false`
+    //   于是「哭 → reset → 再哭」会被当成"已经是这个表情"直接吞掉：
+    //   第一次扣盆正常，第二次扣盆脸就不动了（用户反馈）。
+    //   这里顺手把 currentExpression 拨回 defaultExpression（此时参数本来也就是默认值），
+    //   下次同名表情才会真的重新应用。
+    em.currentExpression = em.defaultExpression;
   } catch (err) {
     /* older builds do not expose resetExpression */
   }
@@ -1735,17 +1746,14 @@ function releaseBasinExpression() {
   state.tempExpr = null;      // 清掉可能残留的临时表情，别挡住复原
   state.tempUntil = 0;
   state.expression = null;
-  // 复原时**绝不能用 resetExpression()**：实测它会让之后所有 model.expression()
-  // 都不再生效 —— 表现就是"盆飞走后再按盆，表情就不变了"（用户反馈）。
-  // 所以这里必须落到一个**具体的表情名**上：优先当前状态的基础表情，
-  // 没有（idle / done 的 expr 是 null）就抽一个该状态的心情表情。
-  const base = exprFor(state.key) || pickAllowed(MOOD_POOLS[state.key] || MOOD_POOLS.idle);
-  if (base) {
-    state.expression = null;   // 强制重新应用一次，别被"同表情短路"跳过
-    setExpression(base);
-  } else {
-    state.expression = null;   // 所有表情都被用户关掉了：只能保持现状
-  }
+  // 复原到"当前状态的基础表情"：idle / done 的 expr 是 null —— 也就是**不戴表情**。
+  // 这里以前写的是 `exprFor(...) || pickAllowed(MOOD_POOLS[...])`：状态没有基础表情时
+  // 随机抽一张心情脸顶上，于是"扣完盆脸就变了并且再也不回到无表情"（用户反馈）。
+  // 现在跟 tempExprTick 走同一套（先清标记 + reset 回中性，再按需套基础表情），
+  // 这条路已经验证过不会让后续 model.expression() 失效。
+  resetExpression();
+  const base = exprFor(state.key);
+  if (base) setExpression(base);
   state.moodAt = Date.now();  // 复原后先安静一会儿，别立刻被随机心情换掉
 }
 
@@ -2017,13 +2025,9 @@ function applyState(payload) {
     if (expression) setExpression(expression);
     else if (changed) {
       state.expression = null;
-      try {
-        if (model && model.internalModel.motionManager.expressionManager) {
-          model.internalModel.motionManager.expressionManager.resetExpression();
-        }
-      } catch (err) {
-        /* older builds do not expose resetExpression */
-      }
+      // 统一走 resetExpression()：它会顺手把库里的 currentExpression 拨回默认值，
+      // 否则这里绕过去直接调库函数，下次同名表情又会被"同一个表情"短路掉。
+      resetExpression();
     }
   }
   if (changed && style.motion) playMotion(style.motion);
